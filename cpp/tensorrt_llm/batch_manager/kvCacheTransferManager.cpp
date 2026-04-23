@@ -295,6 +295,13 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
         mPendingWrites.erase(blockPendingWriteItr);
     }
 
+    // Record start event before the first onboard transfer in this iteration
+    if (!offloadedBlock->isPrimary() && !mOnboardStartEvent)
+    {
+        mOnboardStartEvent.emplace(cudaEventDefault);
+        mOnboardManager.getStream().record(*mOnboardStartEvent);
+    }
+
     copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
 
     // Update transfer statistics — distinguish host→GPU onboard from GPU→GPU intra-device copy
@@ -310,6 +317,9 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
         {
             ++mOnboardBlockCount;
             mOnboardByteCount += bytes;
+            // Update end event after each onboard — last one wins
+            mOnboardEndEvent.emplace(cudaEventDefault);
+            mOnboardManager.getStream().record(*mOnboardEndEvent);
         }
     }
 
@@ -347,6 +357,13 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
         mPendingWrites.erase(offloadBlockPendingWriteItr);
     }
 
+    // Record start event before the first offload transfer in this iteration
+    if (!mOffloadStartEvent)
+    {
+        mOffloadStartEvent.emplace(cudaEventDefault);
+        mOffloadManager.getStream().record(*mOffloadStartEvent);
+    }
+
     copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);
 
     // Update transfer statistics
@@ -354,6 +371,9 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
         std::lock_guard<std::mutex> lock(mStatsMutex);
         ++mOffloadBlockCount;
         mOffloadByteCount += computeBlockTransferBytes(pools, numTokensToCopy);
+        // Update end event after each offload — last one wins
+        mOffloadEndEvent.emplace(cudaEventDefault);
+        mOffloadManager.getStream().record(*mOffloadEndEvent);
     }
 
     // Record new pending read from block
@@ -389,9 +409,37 @@ void KVCacheTransferManager::syncTransfers()
     mOnboardManager.getStream().record(onboardEvent);
     mBufferManager.getStream().wait(onboardEvent);
 
+    // Collect GPU-side timing from CUDA events now that both streams are idle.
+    collectTransferTiming();
+
     // Once we synchronize, clear our list of pending thransfers.
     mPendingReads.clear();
     mPendingWrites.clear();
+}
+
+void KVCacheTransferManager::collectTransferTiming()
+{
+    std::lock_guard<std::mutex> lock(mStatsMutex);
+
+    if (mOnboardStartEvent && mOnboardEndEvent)
+    {
+        float ms = 0;
+        mOnboardEndEvent->synchronize();
+        cudaEventElapsedTime(&ms, mOnboardStartEvent->get(), mOnboardEndEvent->get());
+        mOnboardTimeMs += ms;
+    }
+    mOnboardStartEvent.reset();
+    mOnboardEndEvent.reset();
+
+    if (mOffloadStartEvent && mOffloadEndEvent)
+    {
+        float ms = 0;
+        mOffloadEndEvent->synchronize();
+        cudaEventElapsedTime(&ms, mOffloadStartEvent->get(), mOffloadEndEvent->get());
+        mOffloadTimeMs += ms;
+    }
+    mOffloadStartEvent.reset();
+    mOffloadEndEvent.reset();
 }
 
 KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()
@@ -400,14 +448,18 @@ KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()
     KvCacheTransferStats stats;
     stats.onboardBlocks = mOnboardBlockCount;
     stats.onboardBytes = mOnboardByteCount;
+    stats.onboardTimeMs = mOnboardTimeMs;
     stats.offloadBlocks = mOffloadBlockCount;
     stats.offloadBytes = mOffloadByteCount;
+    stats.offloadTimeMs = mOffloadTimeMs;
     stats.intraDeviceCopyBlocks = mIntraDeviceCopyBlockCount;
     stats.intraDeviceCopyBytes = mIntraDeviceCopyByteCount;
     mOnboardBlockCount = 0;
     mOnboardByteCount = 0;
+    mOnboardTimeMs = 0;
     mOffloadBlockCount = 0;
     mOffloadByteCount = 0;
+    mOffloadTimeMs = 0;
     mIntraDeviceCopyBlockCount = 0;
     mIntraDeviceCopyByteCount = 0;
     return stats;

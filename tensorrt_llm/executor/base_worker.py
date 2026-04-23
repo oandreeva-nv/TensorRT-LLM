@@ -692,8 +692,10 @@ class BaseWorker(GenerationExecutor):
                     "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
                     "iterOnboardBlocks": s.iter_onboard_blocks,
                     "iterOnboardBytes": s.iter_onboard_bytes,
+                    "iterOnboardTimeMs": getattr(s, "iter_onboard_time_ms", 0),
                     "iterOffloadBlocks": s.iter_offload_blocks,
                     "iterOffloadBytes": s.iter_offload_bytes,
+                    "iterOffloadTimeMs": getattr(s, "iter_offload_time_ms", 0),
                     "iterIntraDeviceCopyBlocks":
                     s.iter_intra_device_copy_blocks,
                     "iterIntraDeviceCopyBytes": s.iter_intra_device_copy_bytes,

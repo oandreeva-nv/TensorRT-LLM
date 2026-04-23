@@ -35,8 +35,10 @@ struct KvCacheTransferStats
 {
     SizeType32 onboardBlocks{0};
     std::size_t onboardBytes{0};
+    float onboardTimeMs{0};
     SizeType32 offloadBlocks{0};
     std::size_t offloadBytes{0};
+    float offloadTimeMs{0};
     SizeType32 intraDeviceCopyBlocks{0};
     std::size_t intraDeviceCopyBytes{0};
 };
@@ -114,15 +116,28 @@ private:
     std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     int mDeviceId;
 
+    //! \brief Collect GPU-side transfer timing from CUDA events recorded during onboard/offload.
+    //! Must be called after syncTransfers() when both streams are idle.
+    void collectTransferTiming();
+
     // Cumulative transfer statistics, reset on each call to getAndResetTransferStats().
     // Protected by mStatsMutex for thread-safe access.
     mutable std::mutex mStatsMutex;
     SizeType32 mOnboardBlockCount{0};
     std::size_t mOnboardByteCount{0};
+    float mOnboardTimeMs{0};
     SizeType32 mOffloadBlockCount{0};
     std::size_t mOffloadByteCount{0};
+    float mOffloadTimeMs{0};
     SizeType32 mIntraDeviceCopyBlockCount{0};
     std::size_t mIntraDeviceCopyByteCount{0};
+
+    // Per-iteration CUDA events for measuring aggregate transfer time.
+    // Recorded around the batch of transfers in each iteration.
+    std::optional<tr::CudaEvent> mOnboardStartEvent;
+    std::optional<tr::CudaEvent> mOnboardEndEvent;
+    std::optional<tr::CudaEvent> mOffloadStartEvent;
+    std::optional<tr::CudaEvent> mOffloadEndEvent;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

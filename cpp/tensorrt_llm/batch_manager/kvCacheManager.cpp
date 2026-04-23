@@ -2762,8 +2762,10 @@ KvCacheIterationStats WindowBlockManager::getAndResetIterationStats()
         auto transferStats = mTransferManager->getAndResetTransferStats();
         stats.iterOnboardBlocks = transferStats.onboardBlocks;
         stats.iterOnboardBytes = transferStats.onboardBytes;
+        stats.iterOnboardTimeMs = transferStats.onboardTimeMs;
         stats.iterOffloadBlocks = transferStats.offloadBlocks;
         stats.iterOffloadBytes = transferStats.offloadBytes;
+        stats.iterOffloadTimeMs = transferStats.offloadTimeMs;
         stats.iterIntraDeviceCopyBlocks = transferStats.intraDeviceCopyBlocks;
         stats.iterIntraDeviceCopyBytes = transferStats.intraDeviceCopyBytes;
     }

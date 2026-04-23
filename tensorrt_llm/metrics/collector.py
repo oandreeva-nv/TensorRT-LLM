@@ -277,9 +277,19 @@ class MetricsCollector:
             name=self.metric_prefix + "kv_cache_onboard_bytes_total",
             documentation="Total bytes transferred from host to GPU (onboard)",
             labelnames=self.labels.keys())
+        self.kv_cache_onboard_time_ms_total = Counter(
+            name=self.metric_prefix + "kv_cache_onboard_time_ms_total",
+            documentation=
+            "Total GPU-measured time in ms for host to GPU transfers (onboard)",
+            labelnames=self.labels.keys())
         self.kv_cache_offload_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_offload_bytes_total",
             documentation="Total bytes transferred from GPU to host (offload)",
+            labelnames=self.labels.keys())
+        self.kv_cache_offload_time_ms_total = Counter(
+            name=self.metric_prefix + "kv_cache_offload_time_ms_total",
+            documentation=
+            "Total GPU-measured time in ms for GPU to host transfers (offload)",
             labelnames=self.labels.keys())
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
@@ -688,7 +698,9 @@ class MetricsCollector:
             total_missed = 0
             total_gen_alloc = 0
             total_onboard_bytes = 0
+            total_onboard_time_ms = 0
             total_offload_bytes = 0
+            total_offload_time_ms = 0
             total_intra_device_copy_bytes = 0
 
             for ws_stats in kv_iter.values():
@@ -702,7 +714,9 @@ class MetricsCollector:
                 total_missed += ws_stats.get("iterMissedBlocks", 0)
                 total_gen_alloc += ws_stats.get("iterGenAllocBlocks", 0)
                 total_onboard_bytes += ws_stats.get("iterOnboardBytes", 0)
+                total_onboard_time_ms += ws_stats.get("iterOnboardTimeMs", 0)
                 total_offload_bytes += ws_stats.get("iterOffloadBytes", 0)
+                total_offload_time_ms += ws_stats.get("iterOffloadTimeMs", 0)
                 total_intra_device_copy_bytes += ws_stats.get(
                     "iterIntraDeviceCopyBytes", 0)
 
@@ -734,9 +748,15 @@ class MetricsCollector:
             if total_onboard_bytes > 0:
                 self._log_counter(self.kv_cache_onboard_bytes_total, {},
                                   total_onboard_bytes)
+            if total_onboard_time_ms > 0:
+                self._log_counter(self.kv_cache_onboard_time_ms_total, {},
+                                  total_onboard_time_ms)
             if total_offload_bytes > 0:
                 self._log_counter(self.kv_cache_offload_bytes_total, {},
                                   total_offload_bytes)
+            if total_offload_time_ms > 0:
+                self._log_counter(self.kv_cache_offload_time_ms_total, {},
+                                  total_offload_time_ms)
             if total_intra_device_copy_bytes > 0:
                 self._log_counter(self.kv_cache_intra_device_copy_bytes_total,
                                   {}, total_intra_device_copy_bytes)

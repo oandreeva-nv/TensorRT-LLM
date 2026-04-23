@@ -288,8 +288,10 @@ struct KvCacheIterationStats
     // Transfer traffic deltas — host ↔ GPU
     SizeType32 iterOnboardBlocks{0};
     std::size_t iterOnboardBytes{0};
+    float iterOnboardTimeMs{0};
     SizeType32 iterOffloadBlocks{0};
     std::size_t iterOffloadBytes{0};
+    float iterOffloadTimeMs{0};
     // Intra-device (GPU → GPU) block copies (e.g. partial reuse when source block has refs)
     SizeType32 iterIntraDeviceCopyBlocks{0};
     std::size_t iterIntraDeviceCopyBytes{0};

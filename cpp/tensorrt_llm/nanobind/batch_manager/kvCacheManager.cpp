@@ -376,8 +376,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("iter_gen_alloc_blocks", &tbk::KvCacheIterationStats::iterGenAllocBlocks)
         .def_rw("iter_onboard_blocks", &tbk::KvCacheIterationStats::iterOnboardBlocks)
         .def_rw("iter_onboard_bytes", &tbk::KvCacheIterationStats::iterOnboardBytes)
+        .def_rw("iter_onboard_time_ms", &tbk::KvCacheIterationStats::iterOnboardTimeMs)
         .def_rw("iter_offload_blocks", &tbk::KvCacheIterationStats::iterOffloadBlocks)
         .def_rw("iter_offload_bytes", &tbk::KvCacheIterationStats::iterOffloadBytes)
+        .def_rw("iter_offload_time_ms", &tbk::KvCacheIterationStats::iterOffloadTimeMs)
         .def_rw("iter_intra_device_copy_blocks", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBlocks)
         .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes);
 
