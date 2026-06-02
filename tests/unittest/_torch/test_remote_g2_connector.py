@@ -165,27 +165,51 @@ def _resolve_result(block_hashes=(11, 22, 33), num_tokens=48, lease_id="lease-1"
 
 
 class _FakeTransferResult:
-    def __init__(self, record, completed=True, fail=False):
+    def __init__(
+        self,
+        record,
+        completed=True,
+        fail=False,
+        fail_after_polls=None,
+        succeed_after_polls=None,
+    ):
         self.record = record
         self.completed = completed
         self.fail = fail
+        self.fail_after_polls = fail_after_polls
+        self.succeed_after_polls = succeed_after_polls
         self.released = 0
+        self.poll_count = 0
 
     def is_completed(self):
+        self.poll_count += 1
         if self.fail:
             raise RuntimeError("transfer failed")
+        if self.fail_after_polls is not None:
+            if self.poll_count >= self.fail_after_polls:
+                raise RuntimeError(f"transfer failed at poll {self.poll_count}")
+            return False
+        if self.succeed_after_polls is not None:
+            return self.poll_count >= self.succeed_after_polls
         return self.completed
 
     def release(self):
         self.released += 1
 
+    def abort(self):
+        # Exercised by the Group F driving tests; harmless to existing tests.
+        self.aborted = getattr(self, "aborted", 0) + 1
+
 
 class _FakeTransferAdapter:
-    def __init__(self, result_factory=None):
+    def __init__(self, result_factory=None, start_raise=False):
         self.started = []
         self.result_factory = result_factory
+        self.start_raise = start_raise
 
     def start_transfer(self, record):
+        if self.start_raise:
+            raise RuntimeError("start_transfer failed")
         self.started.append(record)
         if self.result_factory is not None:
             return self.result_factory(record)
@@ -534,6 +558,486 @@ def test_remote_g2_worker_observability_never_logs_raw_descriptors():
     for event in sink.events:
         detail_text = " ".join(event.details)
         assert not any(value in detail_text for value in forbidden)
+
+
+# Failure-mode pinning: today's transfer-failure contract is "raise
+# RuntimeError out of the worker hook" for all three failure paths —
+# start_transfer raises, is_completed raises mid-flight, and the 30 s
+# timeout. The `*_today` suffix marks assertions that will flip when the
+# structured failure API lands (worker should report failed block IDs
+# instead of propagating). Tests without `*_today` pin invariants that
+# should remain stable across the rewrite (lease released once, no
+# binding published, fallback event emitted).
+
+
+# Group A — start_transfer raises (resolve / adapter-setup failure)
+
+
+def test_transfer_start_raise_propagates_runtime_error_today():
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(start_raise=True),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    with pytest.raises(RuntimeError, match="failed to start"):
+        worker.start_load_kv(None)
+
+
+def test_transfer_start_raise_releases_lease_once():
+    released = []
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(start_raise=True),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    with pytest.raises(RuntimeError):
+        worker.start_load_kv(None)
+    assert released == [("lease-bound", "transfer_start_failed")]
+
+
+def test_transfer_start_raise_does_not_publish_binding():
+    published = []
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(start_raise=True),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=published.append,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    with pytest.raises(RuntimeError):
+        worker.start_load_kv(None)
+    assert published == []
+
+
+def test_transfer_start_raise_emits_fallback_event():
+    sink = InMemoryRemoteG2ObservabilitySink()
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(start_raise=True),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+        observability=sink,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    with pytest.raises(RuntimeError):
+        worker.start_load_kv(None)
+    fallback = [event for event in sink.events if event.event == "fallback"]
+    assert fallback
+    assert fallback[0].reason == "transfer_start_failed"
+
+
+# Group B — is_completed raises mid-flight (after N successful polls)
+# (first-poll raise is already covered by
+# test_remote_g2_worker_failure_releases_once_and_publishes_nothing)
+
+
+def test_transfer_after_n_polls_raise_propagates_today():
+    def make_result(record):
+        return _FakeTransferResult(record, fail_after_polls=3)
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    # Polls 1 and 2 return False; poll 3 raises.
+    assert worker.get_finished([], [1234]) == ([], [])
+    assert worker.get_finished([], [1234]) == ([], [])
+    with pytest.raises(RuntimeError, match="failed closed"):
+        worker.get_finished([], [1234])
+
+
+# Group C — timeout (deadline exceeded before is_completed returns True)
+
+
+def test_transfer_timeout_propagates_runtime_error_today():
+    def make_result(record):
+        return _FakeTransferResult(record, completed=False)
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+        transfer_timeout_ms=-1,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    with pytest.raises(RuntimeError, match="timed out"):
+        worker.get_finished([], [1234])
+
+
+def test_transfer_timeout_emits_fallback_event():
+    sink = InMemoryRemoteG2ObservabilitySink()
+
+    def make_result(record):
+        return _FakeTransferResult(record, completed=False)
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+        observability=sink,
+        transfer_timeout_ms=-1,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    with pytest.raises(RuntimeError, match="timed out"):
+        worker.get_finished([], [1234])
+    fallback = [event for event in sink.events if event.event == "fallback"]
+    assert fallback
+    assert fallback[0].reason == "transfer_timeout"
+
+
+# Group E — structured failure reporting (target API, xfail today)
+# These describe the contract the rewrite must produce. They xfail today
+# because either (a) the failure path still propagates instead of
+# reporting, or (b) the new `get_block_ids_with_load_errors` accessor
+# doesn't exist yet. strict=True means an XPASS (unexpected success) will
+# fail the suite — so when the rewrite lands and a driving test starts
+# passing, CI will tell us to drop the marker and remove the matching
+# *_today pinning test in Groups A–C.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=RuntimeError,
+    reason="start_load_kv should not propagate when transfer setup fails; "
+    "structured failure reporting API not yet implemented",
+)
+def test_transfer_start_raise_does_not_propagate():
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(start_raise=True),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)  # must NOT raise after the rewrite
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AttributeError,
+    reason="get_block_ids_with_load_errors accessor not yet implemented",
+)
+def test_transfer_start_raise_reports_failed_block_ids():
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(start_raise=True),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    try:
+        worker.start_load_kv(None)
+    except RuntimeError:
+        pass  # today's behavior; the rewrite must not raise
+    failed = worker.get_block_ids_with_load_errors()
+    assert failed == [100, 101, 102]  # target_block_ids from _bound_record()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=RuntimeError,
+    reason="get_finished should not propagate on mid-flight transfer error",
+)
+def test_transfer_first_poll_raise_does_not_propagate():
+    def make_result(record):
+        return _FakeTransferResult(record, completed=False, fail=True)
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    worker.get_finished([], [1234])  # must NOT raise after the rewrite
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AttributeError,
+    reason="get_block_ids_with_load_errors accessor not yet implemented",
+)
+def test_transfer_first_poll_raise_reports_failed_block_ids():
+    def make_result(record):
+        return _FakeTransferResult(record, completed=False, fail=True)
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    try:
+        worker.get_finished([], [1234])
+    except RuntimeError:
+        pass
+    failed = worker.get_block_ids_with_load_errors()
+    assert failed == [100, 101, 102]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=RuntimeError,
+    reason="get_finished should not propagate on timeout",
+)
+def test_transfer_timeout_does_not_propagate():
+    def make_result(record):
+        return _FakeTransferResult(record, completed=False)
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+        transfer_timeout_ms=-1,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    worker.get_finished([], [1234])  # must NOT raise after the rewrite
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AttributeError,
+    reason="get_block_ids_with_load_errors accessor not yet implemented",
+)
+def test_transfer_timeout_reports_failed_block_ids():
+    def make_result(record):
+        return _FakeTransferResult(record, completed=False)
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+        transfer_timeout_ms=-1,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    try:
+        worker.get_finished([], [1234])
+    except RuntimeError:
+        pass
+    failed = worker.get_block_ids_with_load_errors()
+    assert failed == [100, 101, 102]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AttributeError,
+    reason="get_block_ids_with_load_errors accessor not yet implemented",
+)
+def test_failed_block_ids_drained_once_per_step():
+    """Each call should clear the internal failure list so the same
+    block IDs are not reported twice across consecutive steps."""
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(start_raise=True),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    try:
+        worker.start_load_kv(None)
+    except RuntimeError:
+        pass
+    first = worker.get_block_ids_with_load_errors()
+    second = worker.get_block_ids_with_load_errors()
+    assert first  # failure surfaced
+    assert second == []  # cleared on first read
+
+
+# Group F — initiator-side abort (target API, xfail today)
+# These describe a new abort_request hook on the worker that lets the
+# scheduler tear down an in-flight transfer cleanly (cancellation /
+# preemption). The hook calls result.abort() (mirroring NIXL's
+# abort_xfer), releases the lease, and removes the entry from
+# _active_loads. None of this exists today.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AttributeError,
+    reason="worker.abort_request hook not yet implemented",
+)
+def test_abort_request_calls_result_abort():
+    result_ref = [None]
+
+    def make_result(record):
+        result_ref[0] = _FakeTransferResult(record, completed=False)
+        return result_ref[0]
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    worker.abort_request(1234)
+    assert result_ref[0].aborted == 1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AttributeError,
+    reason="worker.abort_request hook not yet implemented",
+)
+def test_abort_request_releases_lease_once():
+    released = []
+
+    def make_result(record):
+        return _FakeTransferResult(record, completed=False)
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    worker.abort_request(1234)
+    assert released == [("lease-bound", "aborted")]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AttributeError,
+    reason="worker.abort_request hook not yet implemented",
+)
+def test_abort_request_releases_transfer_handle_once():
+    result_ref = [None]
+
+    def make_result(record):
+        result_ref[0] = _FakeTransferResult(record, completed=False)
+        return result_ref[0]
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    worker.abort_request(1234)
+    assert result_ref[0].released == 1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AttributeError,
+    reason="worker.abort_request hook not yet implemented",
+)
+def test_abort_request_after_completion_is_noop():
+    released = []
+    result_ref = [None]
+
+    def make_result(record):
+        result_ref[0] = _FakeTransferResult(record, completed=True)
+        return result_ref[0]
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(),))
+    )
+    worker.start_load_kv(None)
+    worker.get_finished([], [1234])  # completes successfully → lease released once
+    worker.abort_request(1234)  # no-op: nothing to abort
+    # Lease was released exactly once on success; abort must not double-release.
+    assert len(released) == 1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AttributeError,
+    reason="worker.abort_request hook not yet implemented",
+)
+def test_abort_request_unknown_id_is_noop():
+    released = []
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.abort_request(99999)  # no active load with this id
+    assert released == []
 
 
 # Startup check: kv_cache_config.enable_partial_reuse must be False when the
