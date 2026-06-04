@@ -52,7 +52,7 @@ def build_raw_nixl_source_agent(
     try:
         config = nixl_agent_config(
             enable_prog_thread=True,
-            enable_listen_thread=True,
+            enable_listen_thread=False,
             listen_port=0,  # OS-assigned
             backends=["UCX"],
         )
@@ -163,7 +163,7 @@ class RawNixlRemoteG2Adapter:
 
         config = nixl_agent_config(
             enable_prog_thread=True,
-            enable_listen_thread=True,
+            enable_listen_thread=False,
             listen_port=0,
             backends=["UCX"],
         )
