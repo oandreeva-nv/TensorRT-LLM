@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include <mutex>
 
 #include <chrono>
 #include <vector>
@@ -97,6 +98,17 @@ public:
 
     bool verifyQueueIntegrity() const override;
 
+    // Expose the mutex so callers can atomically combine a hasRefs() check
+    // with claimBlock + incRefCount without a race window between the two.
+    std::mutex& getMutex() { return mMutex; }
+
+    // Unlocked claimBlock — caller must hold getMutex().
+    void claimBlockUnlocked(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+        std::optional<std::chrono::milliseconds> durationMs);
+
+    // Unlocked releaseBlock — caller must hold getMutex().
+    void releaseBlockUnlocked(BlockPtr block, bool toFront = false);
+
 private:
     /// @brief A fixed-size container supporting both non-negative and negative indexing.
     ///        Non-negative IDs index directly into positive.
@@ -114,6 +126,13 @@ private:
             return id >= 0 ? positive[id] : negative[-id];
         }
     };
+
+    // Serializes all mutations of mFreeQueues, mFreeBlockIterators, and
+    // mExpiringBlockHeap. Required because the remote-G2 ZMQ REP thread calls
+    // claimBlock/releaseBlock concurrently with the scheduler's getFreeBlock,
+    // claimBlock, and releaseBlock — all of which modify the same intrusive
+    // free list without any other synchronization.
+    mutable std::mutex mMutex;
 
     // Queues of available leaf blocks, split by level and priority: [level][priorityIdx]
     // Levels 0,1 = primary,secondary (real cache); level 2 = placeholder

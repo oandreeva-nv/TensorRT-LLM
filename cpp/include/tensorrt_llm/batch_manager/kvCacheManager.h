@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "tensorrt_llm/batch_manager/blockKey.h"
 #include "tensorrt_llm/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
@@ -448,8 +449,9 @@ private:
     // Choice of pool is encoded into the type
     kernels::KVCacheIndex mMemoryPoolBlockIndex;
 
-    // Number of references to the block
-    SizeType32 mRefCount;
+    // Number of references to the block. Atomic because the remote-G2 ZMQ REP
+    // thread calls incRefCount/decRefCount concurrently with the scheduler loop.
+    std::atomic<SizeType32> mRefCount;
 
     // Number of references to the block
     SizeType32 mSchedulingRefCount;

@@ -139,6 +139,7 @@ bool LRUEvictionPolicy::verifyQueueIntegrity() const
 
 std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
 {
+    std::lock_guard<std::mutex> lock(mMutex);
     SizeType32 const level = wantPlaceholder ? kPlaceholderLevel : cacheLevel;
 
     for (SizeType32 pri = 0; pri < kNumPriorities; pri++)
@@ -165,7 +166,7 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block)
     releaseBlock(block, false);
 }
 
-void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
+void LRUEvictionPolicy::releaseBlockUnlocked(BlockPtr block, bool toFront)
 {
     // The dummy root block (kCachedBlocksRootId) is permanently attached to the lookup tree
     // via setAsRoot() and must never enter the eviction queue — it is not a real cache block.
@@ -205,8 +206,15 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     }
 }
 
+void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    releaseBlockUnlocked(block, toFront);
+}
+
 SizeType32 LRUEvictionPolicy::getNumFreeBlocks(SizeType32 cacheLevel)
 {
+    std::lock_guard<std::mutex> lock(mMutex);
     return mNumFreeBlocksPerLevel[cacheLevel];
 }
 
@@ -215,7 +223,7 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block)
     claimBlock(block, std::nullopt, std::nullopt);
 }
 
-void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+void LRUEvictionPolicy::claimBlockUnlocked(BlockPtr block, std::optional<executor::RetentionPriority> priority,
     std::optional<std::chrono::milliseconds> durationMs)
 {
     SizeType32 const id = block->getBlockId();
@@ -238,6 +246,13 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
     block->setDurationMs(durationMs);
 }
 
+void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+    std::optional<std::chrono::milliseconds> durationMs)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    claimBlockUnlocked(block, priority, durationMs);
+}
+
 std::chrono::steady_clock::time_point::duration LRUEvictionPolicy::getTime() const
 {
     return std::chrono::steady_clock::now().time_since_epoch();
@@ -245,6 +260,7 @@ std::chrono::steady_clock::time_point::duration LRUEvictionPolicy::getTime() con
 
 void LRUEvictionPolicy::refresh()
 {
+    std::lock_guard<std::mutex> lock(mMutex);
     while (!mExpiringBlockHeap.empty())
     {
         auto const block = *mExpiringBlockHeap.begin();

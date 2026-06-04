@@ -259,9 +259,9 @@ void KVCacheBlock::incRefCount()
 
 void KVCacheBlock::decRefCount()
 {
+    auto const prev = mRefCount.fetch_sub(1);
     TLLM_CHECK_WITH_INFO(
-        hasRefs(), "Can't remove link from block (id=%d) that is not allocated", static_cast<int>(mBlockId));
-    mRefCount--;
+        prev > 0, "Can't remove link from block (id=%d) that is not allocated", static_cast<int>(mBlockId));
 }
 
 void KVCacheBlock::decSchedulingRefCount()
@@ -1292,11 +1292,28 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
 {
     if (!offloadBlock->isPlaceholder() && !offloadBlock->isPrimary())
     {
+        // Fast check: if already pinned, skip the expensive DMA entirely.
+        if (offloadBlock->hasRefs())
+        {
+            return;
+        }
         auto block = getFreeBlock(
             sequence, executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt, mode, directory);
         mTransferManager->onboard(offloadBlock, block, mPools, 0, mode, directory);
-        // swap linear block offsets (i.e. make block the offload block and vice versa)
-        offloadBlock->swapMemoryPoolBlockOffset(block);
+
+        // Second check + swap under the LRU mutex so pinBlocksById cannot pin
+        // offloadBlock between the first check and the swap. If a concurrent
+        // pinBlocksById incremented mRefCount while the DMA was in-flight we
+        // abort and return the primary slot to the free pool.
+        {
+            std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+            if (offloadBlock->hasRefs())
+            {
+                mEvictionPolicy->releaseBlockUnlocked(block);
+                return;
+            }
+            offloadBlock->swapMemoryPoolBlockOffset(block);
+        }
 
         if (mEventManager)
         {
@@ -2068,9 +2085,10 @@ std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>> WindowBlockManager::
             continue;
         }
 
-        // Atomic pin (claim from free queue + refcount bump) under the lookup mutex,
-        // mirroring pinBlocksById's body but inlined here so the bump cannot race
-        // against an eviction that observes the block momentarily unpinned.
+        // Atomic pin (claim from free queue + refcount bump) under the lookup
+        // mutex (held by caller). onboardBlock always runs under the trie mutex,
+        // so the window between claimBlock and incRefCount is protected — no
+        // additional LRU lock needed here.
         if (!block->hasRefs())
         {
             mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());
@@ -2866,10 +2884,15 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
         auto block = mAllBlocksById[blockId];
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
+            // Hold LRU mutex across decRefCount + hasRefs + releaseBlock so
+            // there is no window where mRefCount == 0 but the block is not yet
+            // back in the free queue — which would let a concurrent pinBlocksById
+            // claimBlock (no-op) + incRefCount on a block about to be released.
+            std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
             block->decRefCount();
             if (!block->hasRefs())
             {
-                mEvictionPolicy->releaseBlock(block);
+                mEvictionPolicy->releaseBlockUnlocked(block);
             }
         }
     }
@@ -2895,14 +2918,19 @@ std::vector<std::pair<SizeType32, SizeType32>> WindowBlockManager::pinBlocksById
         auto block = mAllBlocksById[blockId];
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
-            // If the block has no refs it sits in the eviction policy's free
-            // queue. Claim it first so the matching unpinBlocksById /
-            // releaseBlock cycle does not create a duplicate queue entry.
-            if (!block->hasRefs())
+            // Hold the LRU mutex across hasRefs() + claimBlock + incRefCount so
+            // there is no window where the block is off the free queue but has
+            // mRefCount == 0 — which would let onboardBlock's hasRefs() check
+            // see false and relocate a block being pinned.
             {
-                mEvictionPolicy->claimBlock(block, block->getPriority(), block->getDurationMs());
+                std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+                if (!block->hasRefs())
+                {
+                    mEvictionPolicy->claimBlockUnlocked(
+                        block, block->getPriority(), block->getDurationMs());
+                }
+                block->incRefCount();
             }
-            block->incRefCount();
             // Capture the post-pin (slot, level) atomically with the pin so
             // callers cannot observe a slot that diverges from the held pin.
             locations.emplace_back(
