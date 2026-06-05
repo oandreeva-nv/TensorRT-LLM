@@ -1179,17 +1179,13 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     if (!wantPlaceholder && !block->getUniqueTokens().empty() && canOffload
         && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0)
     {
-        // Offload block in primary memory before repurposing
-        auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
+        // Use claimFreeBlock (atomic select + remove) so the ZMQ REP thread's
+        // findAndPinSecondaryBlockByHash cannot claim offloadBlock between a
+        // getFreeBlock peek and a separate claimBlock removal.
+        auto offloadBlock = std::get<0>(mEvictionPolicy->claimFreeBlock(kSecondaryLevel));
 
-        // Claim both blocks BEFORE the swap so that getCacheLevel() returns the
-        // correct pre-swap level.  Previously the claims happened after the swap,
-        // causing claimBlock to erase from the wrong per-level free queue (UB) and
-        // to modify the wrong level's free-block counter — the root cause of
-        // getNumFreeBlocks() exceeding getMaxNumBlocks() in disagg/prefill mode
-        // (GitHub #11879).
-        mEvictionPolicy->claimBlock(block);        // primary block → claimed from primary queue
-        mEvictionPolicy->claimBlock(offloadBlock); // secondary block → claimed from secondary queue
+        // Claim primary block separately (no race risk — ZMQ only targets secondary).
+        mEvictionPolicy->claimBlock(block, std::nullopt, std::nullopt);
 
         mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
@@ -1346,9 +1342,8 @@ void WindowBlockManager::offloadBlock(
     if (!block->isPlaceholder() && block->isPrimary())
     {
         // Offload block in primary memory before repurposing
-        auto offloadBlock = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
-        // If we're swapping a block to secondary memory, maintain the prior priority values.
-        mEvictionPolicy->claimBlock(offloadBlock);
+        // claimFreeBlock atomically selects and removes from secondary queue.
+        auto offloadBlock = std::get<0>(mEvictionPolicy->claimFreeBlock(kSecondaryLevel));
         mTransferManager->offload(block, offloadBlock, mPools, 0, mode, directory);
         // swap linear block offsets (i.e. make block the offload block)
         block->swapMemoryPoolBlockOffset(offloadBlock);

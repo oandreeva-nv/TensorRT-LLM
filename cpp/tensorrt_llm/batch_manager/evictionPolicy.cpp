@@ -144,15 +144,33 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
 
     for (SizeType32 pri = 0; pri < kNumPriorities; pri++)
     {
-        // Find the first non-empty queue, and return the first block.
         if (!mFreeQueues[level][pri].empty())
         {
             auto block = mFreeQueues[level][pri].front();
+            bool const canOffload
+                = !wantPlaceholder && cacheLevel == 0 && pri >= getPriorityIdx(mSecondaryOffloadMinPriority);
+            return std::make_tuple(block, canOffload);
+        }
+    }
+    TLLM_THROW("No free block found. This shouldn't happen!");
+}
 
-            // mFreeQueues only contains leaf blocks, so no need to iterate through the next block pointers.
-            // It's possible to have a primary block with children in secondary memory. We handle this
-            // by freeing all descendants in WindowBlockManager::getFreeBlock. This is done either by
-            // offloading (preferred method) or explicitly.
+std::tuple<BlockPtr, bool> LRUEvictionPolicy::claimFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    SizeType32 const level = wantPlaceholder ? kPlaceholderLevel : cacheLevel;
+
+    for (SizeType32 pri = 0; pri < kNumPriorities; pri++)
+    {
+        if (!mFreeQueues[level][pri].empty())
+        {
+            auto block = mFreeQueues[level][pri].front();
+            // Atomically remove from queue so no concurrent caller can claim
+            // the same block between getFreeBlock and claimBlock.
+            mFreeQueues[level][pri].pop_front();
+            mFreeBlockIterators[block->getBlockId()] = std::nullopt;
+            mNumFreeBlocksPerLevel[level]--;
+            mExpiringBlockHeap.erase(block);
             bool const canOffload
                 = !wantPlaceholder && cacheLevel == 0 && pri >= getPriorityIdx(mSecondaryOffloadMinPriority);
             return std::make_tuple(block, canOffload);

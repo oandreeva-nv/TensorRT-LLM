@@ -42,6 +42,12 @@ public:
     /// @returns The pointer to the free block, along with whether it can be offloaded
     /// @param wantPlaceholder If true, return a placeholder block instead of a normal block
     virtual std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) = 0;
+
+    /// @brief Atomically select and remove a free block from the queue in one operation.
+    ///        Unlike getFreeBlock + claimBlock, this closes the race window where a
+    ///        concurrent caller (e.g. remote-G2 ZMQ REP thread) could claim the same
+    ///        block between the two calls.
+    virtual std::tuple<BlockPtr, bool> claimFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) = 0;
     /// @brief Release a block. Prioritize the block for eviction if toFront=true
     virtual void releaseBlock(BlockPtr block) = 0;
     virtual void releaseBlock(BlockPtr block, bool toFront) = 0;
@@ -56,6 +62,15 @@ public:
     virtual void refresh() = 0;
 
     virtual bool verifyQueueIntegrity() const = 0;
+
+    // Mutex and unlocked variants — exposed so callers can atomically combine
+    // multiple LRU operations (e.g. hasRefs check + claim + incRefCount).
+    // Caller must hold getMutex() before calling any *Unlocked method.
+    virtual std::mutex& getMutex() = 0;
+    virtual void claimBlockUnlocked(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+        std::optional<std::chrono::milliseconds> durationMs)
+        = 0;
+    virtual void releaseBlockUnlocked(BlockPtr block, bool toFront = false) = 0;
 };
 
 struct ExpiringBlockComparator
@@ -80,6 +95,7 @@ public:
     void initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById);
 
     std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
+    std::tuple<BlockPtr, bool> claimFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
 
     void releaseBlock(BlockPtr block) override;
     void releaseBlock(BlockPtr block, bool toFront) override;
