@@ -21,7 +21,7 @@ except ImportError:
     from cuda import cudart
 
 from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
-                                 mpi_comm, mpi_disabled, nvtx_range,
+                                 mpi_comm, mpi_disabled, mpi_rank, nvtx_range,
                                  set_thread_local_mpi_comm, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
@@ -74,6 +74,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (ResourceManager, ResourceManagerType,
+                               _KV_OFFLOAD_DIAG, _kv_stats_str,
                                request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
@@ -3082,6 +3083,20 @@ class PyExecutor:
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
+                    # ── KV offload diagnostic: per-iteration summary ─────
+                    if _KV_OFFLOAD_DIAG and self.kv_cache_manager is not None:
+                        _n_ctx = scheduled_batch.num_context_requests
+                        _n_gen = scheduled_batch.num_generation_requests
+                        _n_active = len(self.active_requests)
+                        _st = _kv_stats_str(self.kv_cache_manager)
+                        print(
+                            "[KV_DIAG] rank=%d iter=%d "
+                            "ctx=%d gen=%d active=%d %s"
+                            % (self.dist.rank, self.iter_counter,
+                               _n_ctx, _n_gen, _n_active, _st),
+                            flush=True)
+                    # ─────────────────────────────────────────────────────
+
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
@@ -4486,6 +4501,115 @@ class PyExecutor:
                 if self.kv_connector_manager.request_finished(
                         req, cache_block_ids):
                     self.async_transfer_manager.start_transfer(req)
+                elif self.kv_cache_manager is not None:
+                    # remote_g2 path: request_finished returned False so
+                    # start_transfer was NOT called and blocks are NOT
+                    # stored in the radix trie.  Store them now so
+                    # they're findable by hash when the decode worker's
+                    # resolve_hashes request arrives.
+                    #
+                    # Fix 5 + Fix 10: Pin blocks only when a remote
+                    # worker has actually sent a resolve_and_lease or
+                    # resolve_hashes (the "lease gate") AND the primary
+                    # pool has enough free blocks to avoid starving the
+                    # scheduler.
+                    #
+                    # Budget enforcement: the effective budget is
+                    # min(TRTLLM_PREFILL_PIN_BUDGET, total_primary//4).
+                    # We pass len(cache_block_ids) as est_new_blocks
+                    # so a single large request cannot overshoot the cap.
+                    #
+                    # Without remote resolve activity, pin_blocks=False:
+                    # blocks are stored in the trie (findable by hash)
+                    # but are evictable, so the scheduler never starves.
+                    _prefill_pin_budget = int(os.environ.get(
+                        "TRTLLM_PREFILL_PIN_BUDGET", "32"))
+                    try:
+                        from .connectors.remote_g2_source_setup import (
+                            register_prefill_pins,
+                            should_prefill_pin,
+                        )
+                        _free = self.kv_cache_manager.get_num_free_blocks()
+                        _max_bps = getattr(
+                            self.kv_cache_manager,
+                            'max_blocks_per_seq', 128)
+                        # Total primary pool size for auto-cap.
+                        try:
+                            _kv_stats = (
+                                self.kv_cache_manager
+                                .get_kv_cache_stats())
+                            _total_primary = getattr(
+                                _kv_stats, 'max_num_blocks', 0)
+                        except Exception:
+                            _total_primary = 0
+                        # Estimate blocks this request will pin.
+                        _est_blocks = len(cache_block_ids) \
+                            if cache_block_ids else 0
+                        _use_pin = should_prefill_pin(
+                            _free, _max_bps, _prefill_pin_budget,
+                            total_primary_blocks=_total_primary,
+                            est_new_blocks=_est_blocks)
+                    except ImportError:
+                        _use_pin = False
+                        _free = -1
+                        _max_bps = -1
+                        _total_primary = 0
+                        _est_blocks = 0
+
+                    try:
+                        block_ids = (
+                            self.kv_cache_manager.store_blocks_for_reuse(
+                                req, pin_blocks=_use_pin))
+                        if _use_pin and block_ids:
+                            try:
+                                _stale = register_prefill_pins(
+                                    block_ids)
+                                # Unpin stale blocks returned by the
+                                # periodic inline sweep (Fix 10c).
+                                if _stale:
+                                    try:
+                                        self.kv_cache_manager \
+                                            .unpin_blocks_by_id(
+                                                _stale)
+                                    except Exception:
+                                        pass
+                                    if _KV_OFFLOAD_DIAG:
+                                        print(
+                                            "[KV_DIAG] rank=%d "
+                                            "stale_sweep unpinned=%d"
+                                            % (self.dist.rank,
+                                               len(_stale)),
+                                            flush=True)
+                            except Exception:
+                                pass
+                        if _KV_OFFLOAD_DIAG:
+                            print(
+                                "[KV_DIAG] rank=%d trie_store "
+                                "req_id=%d pin=%s free=%d/%d "
+                                "budget=%d eff_budget=%d "
+                                "est_blks=%d total_pri=%d"
+                                % (self.dist.rank,
+                                   req.py_request_id,
+                                   _use_pin,
+                                   _free,
+                                   _max_bps,
+                                   _prefill_pin_budget,
+                                   min(_prefill_pin_budget,
+                                       _total_primary // 4)
+                                   if _total_primary > 0
+                                   else _prefill_pin_budget,
+                                   _est_blocks,
+                                   _total_primary),
+                                flush=True)
+                    except Exception:
+                        logger.warning(
+                            "remote_g2: trie store failed for "
+                            "request %d; blocks may not be "
+                            "findable by hash for cross-worker "
+                            "transfer",
+                            req.py_request_id,
+                            exc_info=True,
+                        )
 
         if self.kv_cache_transceiver:
             for req in scheduled_requests:
@@ -4897,6 +5021,11 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        if _KV_OFFLOAD_DIAG:
+            print(
+                "[KV_DIAG] rank=%d _do_terminate_request req_id=%d"
+                % (self.dist.rank, request.py_request_id),
+                flush=True)
         self.resource_manager.free_resources(request)
 
         if self.gather_all_responses or self.dist.rank == 0:

@@ -115,6 +115,20 @@ def _load_connector_modules():
 
 OBSERVABILITY, REMOTE_G2, TRANSFER, CONNECTOR = _load_connector_modules()
 
+
+@pytest.fixture(autouse=True)
+def _install_identity_slot_lookup():
+    """Production wires this up via maybe_start_remote_g2_target_client; the
+    unit tests construct TargetRemoteG2BindingStore directly and bypass that
+    setup, so without a stub bind_target_blocks fails with
+    target_slot_lookup_failed.  Install an identity stub (slot_idx == block_id)
+    for the test, restore previous value after."""
+    saved = CONNECTOR._installed_block_id_to_slot_idx
+    CONNECTOR.install_block_id_to_slot_idx(lambda ids: list(ids))
+    yield
+    CONNECTOR._installed_block_id_to_slot_idx = saved
+
+
 InMemoryRemoteG2ObservabilitySink = OBSERVABILITY.InMemoryRemoteG2ObservabilitySink
 RemoteG2ConnectorMetadata = CONNECTOR.RemoteG2ConnectorMetadata
 RemoteG2Descriptor = REMOTE_G2.RemoteG2Descriptor
@@ -448,6 +462,9 @@ def test_remote_g2_fault_injection_covers_roadmap_failure_set():
     worker.start_load_kv(None)
     assert adapter.started == [record]
     assert worker.get_finished([], [1234]) == ([], [1234])
+    # Fix 1 (deferred release): release is deferred until allgather.
+    assert released == []
+    worker.on_globally_finished_loading({1234})
     assert released == [("lease-bound", "transfer_succeeded")]
 
 
@@ -470,6 +487,9 @@ def test_remote_g2_duplicate_callbacks_do_not_double_transfer_or_release():
     assert adapter.started == [record]
     assert worker.get_finished([], [1234]) == ([], [1234])
     assert worker.get_finished([], [1234]) == ([], [])
+    # Fix 1 (deferred release): release is deferred until allgather.
+    assert released == []
+    worker.on_globally_finished_loading({1234})
     assert released == [("lease-bound", "transfer_succeeded")]
 
 
@@ -613,6 +633,11 @@ def test_remote_g2_lease_release_is_exactly_once_per_attempt():
     worker.start_load_kv(None)
 
     assert worker.get_finished([], [1234]) == ([], [1234])
+    # Fix 1 (deferred release): release is deferred until allgather.
+    assert released == []
+    worker.on_globally_finished_loading({1234})
+    assert released == [("lease-exact-once", "transfer_succeeded")]
+    # Duplicate call must not produce a second release.
     worker._release_record_once(record, "duplicate_after_success")
     assert released == [("lease-exact-once", "transfer_succeeded")]
 
@@ -697,3 +722,194 @@ def test_remote_g2_observability_contract_covers_required_events_without_raw_add
     for event in sink.events:
         detail_text = " ".join(event.details)
         assert not any(value in detail_text for value in forbidden)
+
+
+# ── Gather rollback prefill-pin test ────────────────────────────────
+
+
+def _load_source_setup():
+    """Load remote_g2_source_setup for prefill pin helpers.
+
+    remote_g2_source_setup does ``from .remote_g2_source_adapter import ...``,
+    so the adapter must be pre-loaded under the package namespace before we
+    attempt to load the setup module (same pattern _load_connector_modules
+    uses for the other connector siblings).
+    """
+    connectors = (
+        _ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "connectors"
+    )
+    _load_module(
+        f"{_CONNECTOR_PACKAGE}.remote_g2_source_adapter",
+        connectors / "remote_g2_source_adapter.py",
+    )
+    return _load_module(
+        f"{_CONNECTOR_PACKAGE}.remote_g2_source_setup",
+        connectors / "remote_g2_source_setup.py",
+    )
+
+
+SOURCE_SETUP = _load_source_setup()
+
+
+def test_gather_rollback_pops_prefill_pins():
+    """Fix 6 completeness: verify that prefill pins registered via
+    register_prefill_pins are removed by pop_prefill_pin during
+    gather rollback, matching the release_lease handler's behavior.
+    """
+    register = SOURCE_SETUP.register_prefill_pins
+    pop = SOURCE_SETUP.pop_prefill_pin
+    has_pins = SOURCE_SETUP.has_prefill_pins
+    pinned = SOURCE_SETUP._prefill_pinned
+    lock = SOURCE_SETUP._prefill_pin_lock
+
+    # Clear any leftover state from other tests.
+    with lock:
+        pinned.clear()
+
+    block_ids = [100, 200, 300]
+    register(block_ids)
+    assert has_pins()
+    assert len(pinned) == 3
+
+    # Simulate rollback: pop each pin (mirrors the rollback path
+    # which calls pop_prefill_pin for each lease pin ref).
+    popped = [pop(bid) for bid in block_ids]
+    assert popped == [True, True, True]
+    assert not has_pins()
+
+    # Double-pop returns False (idempotent).
+    assert pop(100) is False
+
+    # Clean up.
+    with lock:
+        pinned.clear()
+
+
+def test_should_prefill_pin_lease_gate():
+    """Fix 10: should_prefill_pin returns False when no remote resolve has
+    been seen, True after notify_remote_resolve_seen, and False again when
+    free blocks drop to or below the safety floor (max_blocks_per_seq).
+
+    Fix 10a: est_new_blocks overshoot protection and auto-cap
+    (total_primary_blocks // 4).
+    """
+    should_pin = SOURCE_SETUP.should_prefill_pin
+    notify = SOURCE_SETUP.notify_remote_resolve_seen
+    pinned = SOURCE_SETUP._prefill_pinned
+    lock = SOURCE_SETUP._prefill_pin_lock
+
+    # Save and reset module-level state.
+    _saved_flag = SOURCE_SETUP._remote_resolve_seen
+    SOURCE_SETUP._remote_resolve_seen = False
+    with lock:
+        _saved_pins = dict(pinned)
+        pinned.clear()
+
+    try:
+        # ── Lease gate ──────────────────────────────────────────────
+        # No remote resolve seen → never pin, regardless of free blocks.
+        assert should_pin(free_blocks=100, max_blocks_per_seq=10,
+                          pin_budget=64) is False
+
+        # Simulate first remote resolve arriving.
+        notify()
+        assert SOURCE_SETUP.is_remote_resolve_active()
+
+        # Plenty of free blocks → should pin.
+        assert should_pin(free_blocks=100, max_blocks_per_seq=10,
+                          pin_budget=64) is True
+
+        # ── Safety floor ────────────────────────────────────────────
+        # Free blocks at safety floor → refuse to pin.
+        assert should_pin(free_blocks=10, max_blocks_per_seq=10,
+                          pin_budget=64) is False
+
+        # Free blocks below safety floor → refuse to pin.
+        assert should_pin(free_blocks=5, max_blocks_per_seq=10,
+                          pin_budget=64) is False
+
+        # ── Budget exhaustion ───────────────────────────────────────
+        with lock:
+            for i in range(64):
+                pinned[i] = 0.0
+        assert should_pin(free_blocks=100, max_blocks_per_seq=10,
+                          pin_budget=64) is False
+
+        # ── Overshoot protection (Fix 10a) ──────────────────────────
+        with lock:
+            pinned.clear()
+            # 60 pins already registered.
+            for i in range(60):
+                pinned[i] = 0.0
+        # A 10-block request would push to 70, exceeding budget=64.
+        assert should_pin(free_blocks=100, max_blocks_per_seq=10,
+                          pin_budget=64, est_new_blocks=10) is False
+        # A 4-block request would push to 64 — exactly at limit → ok.
+        assert should_pin(free_blocks=100, max_blocks_per_seq=10,
+                          pin_budget=64, est_new_blocks=4) is True
+        # A 5-block request would push to 65 → over limit.
+        assert should_pin(free_blocks=100, max_blocks_per_seq=10,
+                          pin_budget=64, est_new_blocks=5) is False
+
+        # ── Auto-cap (25 % of primary pool, Fix 10a) ───────────────
+        with lock:
+            pinned.clear()
+        # total_primary=80 → effective budget = min(64, 80//4) = 20.
+        assert should_pin(free_blocks=100, max_blocks_per_seq=10,
+                          pin_budget=64, total_primary_blocks=80) is True
+        with lock:
+            for i in range(20):
+                pinned[i] = 0.0
+        # 20 pins == effective budget of 20 → refuse.
+        assert should_pin(free_blocks=100, max_blocks_per_seq=10,
+                          pin_budget=64, total_primary_blocks=80) is False
+        # total_primary=0 (unknown) → skip auto-cap, use pin_budget.
+        with lock:
+            pinned.clear()
+            for i in range(32):
+                pinned[i] = 0.0
+        assert should_pin(free_blocks=100, max_blocks_per_seq=10,
+                          pin_budget=64, total_primary_blocks=0) is True
+
+    finally:
+        # Restore module-level state.
+        SOURCE_SETUP._remote_resolve_seen = _saved_flag
+        with lock:
+            pinned.clear()
+            pinned.update(_saved_pins)
+
+
+def test_register_prefill_pins_returns_stale():
+    """Fix 10c: register_prefill_pins returns stale block IDs after every
+    _PREFILL_SWEEP_INTERVAL calls so stale sweep runs independently of
+    release_lease.
+    """
+    register = SOURCE_SETUP.register_prefill_pins
+    pinned = SOURCE_SETUP._prefill_pinned
+    lock = SOURCE_SETUP._prefill_pin_lock
+    import time as _time
+
+    _saved_count = SOURCE_SETUP._prefill_pin_register_count
+    with lock:
+        _saved_pins = dict(pinned)
+        pinned.clear()
+
+    try:
+        # Manually insert a "stale" pin with timestamp far in the past.
+        with lock:
+            pinned[9999] = _time.monotonic() - SOURCE_SETUP._PREFILL_PIN_TTL_S - 10
+        # Force the counter to one less than the sweep interval so the
+        # next register call triggers the sweep.
+        SOURCE_SETUP._prefill_pin_register_count = (
+            SOURCE_SETUP._PREFILL_SWEEP_INTERVAL - 1)
+
+        stale = register([5000])
+        assert 9999 in stale, f"Expected 9999 in stale, got {stale}"
+        with lock:
+            assert 9999 not in pinned, "stale pin should be removed"
+            assert 5000 in pinned, "new pin should be present"
+    finally:
+        SOURCE_SETUP._prefill_pin_register_count = _saved_count
+        with lock:
+            pinned.clear()
+            pinned.update(_saved_pins)

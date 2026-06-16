@@ -375,6 +375,10 @@ def test_remote_g2_worker_reports_finished_only_after_transfer_success():
     result.completed = True
     assert worker.get_finished([], [1234]) == ([], [1234])
     assert result.released == 1
+    # Fix 1 (deferred release): release is deferred until allgather
+    # confirms all TP ranks are done — not emitted by get_finished.
+    assert released == []
+    worker.on_globally_finished_loading({1234})
     assert released == [("lease-bound", "transfer_succeeded")]
 
 
@@ -449,6 +453,12 @@ def test_remote_g2_worker_publishes_after_local_validity():
     worker.start_load_kv(None)
 
     assert worker.get_finished([], [1234]) == ([], [1234])
+    # Fix 1 (deferred release): get_finished no longer releases
+    # immediately — the release is deferred until allgather confirms
+    # all TP ranks are done.  Validate + publish still happen inline.
+    assert order == ["valid", "publish"]
+    # Simulate the connector manager's allgather callback.
+    worker.on_globally_finished_loading({1234})
     assert order == ["valid", "publish", "release:transfer_succeeded"]
 
 
@@ -468,6 +478,11 @@ def test_remote_g2_worker_emits_transferred_and_released_on_success():
     assert worker.get_finished([], [1234]) == ([], [1234])
     names = _event_names(sink)
     assert "transferred" in names
+    # Fix 1 (deferred release): "released" is not emitted until
+    # on_globally_finished_loading confirms all ranks are done.
+    assert "released" not in names
+    worker.on_globally_finished_loading({1234})
+    names = _event_names(sink)
     assert "released" in names
     assert names.index("transferred") < names.index("released")
 

@@ -256,6 +256,15 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         self._active_loads: dict[int | str, _RemoteG2ActiveLoad] = {}
         self._completed_loads: set[int | str] = set()
         self._released_leases: set[str] = set()
+        # Fix 1: Deferred release — records whose transfers completed
+        # locally but whose release RPC has not yet been sent.  The
+        # release is deferred until the connector manager's allgather
+        # confirms ALL TP ranks finished loading (see
+        # on_globally_finished_loading).  This prevents the source from
+        # unpinning blocks while a sibling target rank is still reading.
+        self._completed_pending_release: dict[
+            int | str, RemoteG2BindingRecord
+        ] = {}
 
     @property
     def _transfer_adapter(self) -> Optional[Any]:
@@ -433,7 +442,31 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
             )
             self._release_record_once(record, "publication_failed")
             raise
-        self._release_record_once(record, "transfer_succeeded")
+        # Fix 1: Do NOT release immediately — defer until the connector
+        # manager's allgather confirms all TP ranks are done loading.
+        # on_globally_finished_loading() will call _release_record_once
+        # for each request in the globally-confirmed set.
+        self._completed_pending_release[record.request_id] = record
+
+    def on_globally_finished_loading(
+        self, globally_finished_ids: set,
+    ) -> None:
+        """Called by KvCacheConnectorManager after mpi_allgather confirms
+        all TP ranks finished loading these request IDs.
+
+        This is the safe point to release source leases — all target
+        ranks have completed their NIXL RDMA reads, so unpinning source
+        blocks cannot cause corruption.
+
+        Non-leader ranks don't have ``_installed_release_lease`` wired,
+        so their ``_release_record_once`` calls fall through to
+        ``_missing_release_lease`` (a no-op).  Only rank 0 actually
+        sends the release RPC.
+        """
+        for req_id in list(self._completed_pending_release.keys()):
+            if req_id in globally_finished_ids:
+                record = self._completed_pending_release.pop(req_id)
+                self._release_record_once(record, "transfer_succeeded")
 
     def _release_record_once(self, record: RemoteG2BindingRecord, reason: str) -> bool:
         lease_id = record.lease_id

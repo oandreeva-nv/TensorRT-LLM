@@ -42,6 +42,31 @@ from .scheduler import ScheduledRequests
 BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
 PoolConfigurationCpp = tensorrt_llm.bindings.internal.batch_manager.PoolConfiguration
+
+# TP offload asymmetry diagnostic.
+_KV_OFFLOAD_DIAG = True
+
+
+def _kv_stats_str(kv_mgr) -> str:
+    """Return a compact one-line summary of primary/secondary block stats."""
+    try:
+        stats = kv_mgr.get_iteration_stats()
+        if stats is None:
+            return "stats=N/A"
+        parts = []
+        for ws, st in stats.items():
+            parts.append(
+                f"ws={ws}:pri(u={st.primary_used_num_blocks}"
+                f"/f={st.primary_free_num_blocks})"
+                f" sec(u={st.secondary_used_num_blocks}"
+                f"/f={st.secondary_free_num_blocks}"
+                f"/max={st.secondary_max_num_blocks})"
+            )
+        return " ".join(parts)
+    except Exception as e:
+        return f"stats_err={e}"
+
+
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfigCpp = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
@@ -709,6 +734,13 @@ class KVCacheManager(BaseResourceManager):
 
             skipped_context_requests = []
             if batch_request_infos:
+                if _KV_OFFLOAD_DIAG:
+                    _pre = _kv_stats_str(self)
+                    _n = len(batch_request_infos)
+                    print(
+                        "[KV_DIAG] rank=%d PRE  add_sequence_batch "
+                        "n_reqs=%d %s" % (mpi_rank(), _n, _pre),
+                        flush=True)
                 if self._requires_retryable_kv_admission():
                     admitted = self.impl.try_add_sequence_batch(
                         batch_request_infos, batch_llm_requests)
@@ -716,6 +748,13 @@ class KVCacheManager(BaseResourceManager):
                     self.impl.add_sequence_batch(batch_request_infos,
                                                  batch_llm_requests)
                     admitted = True
+                if _KV_OFFLOAD_DIAG:
+                    _post = _kv_stats_str(self)
+                    print(
+                        "[KV_DIAG] rank=%d POST add_sequence_batch "
+                        "admitted=%s n_reqs=%d %s"
+                        % (mpi_rank(), admitted, _n, _post),
+                        flush=True)
                 if admitted:
                     for req in batch_ctx_requests:
                         for _ in range(self.num_extra_kv_tokens):
@@ -948,11 +987,39 @@ class KVCacheManager(BaseResourceManager):
         # storing, so that SWA windows are safe to store — blocks won't go out-of-window
         # and be evicted while the context is still in-flight.
         for request in scheduled_batch.context_requests:
+            if _KV_OFFLOAD_DIAG:
+                print(
+                    "[KV_DIAG] rank=%d store_context_blocks "
+                    "req_id=%d prompt_len=%d ctx_remaining=%d"
+                    % (mpi_rank(), request.py_request_id,
+                       request.prompt_len,
+                       getattr(request, 'context_remaining_length', -1)),
+                    flush=True)
             self.impl.store_context_blocks(request)
+            if _KV_OFFLOAD_DIAG:
+                print(
+                    "[KV_DIAG] rank=%d DONE store_context_blocks "
+                    "req_id=%d %s"
+                    % (mpi_rank(), request.py_request_id,
+                       _kv_stats_str(self)),
+                    flush=True)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        return self.impl.remove_sequence(request.py_request_id, request,
-                                         pin_on_release)
+        if _KV_OFFLOAD_DIAG:
+            _pre = _kv_stats_str(self)
+            print(
+                "[KV_DIAG] rank=%d PRE  free_resources req_id=%d %s"
+                % (mpi_rank(), request.py_request_id, _pre),
+                flush=True)
+        result = self.impl.remove_sequence(request.py_request_id, request,
+                                           pin_on_release)
+        if _KV_OFFLOAD_DIAG:
+            _post = _kv_stats_str(self)
+            print(
+                "[KV_DIAG] rank=%d POST free_resources req_id=%d %s"
+                % (mpi_rank(), request.py_request_id, _post),
+                flush=True)
+        return result
 
     def store_blocks_for_reuse(self,
                                request: LlmRequest,
