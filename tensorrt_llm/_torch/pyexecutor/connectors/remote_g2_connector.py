@@ -182,17 +182,6 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
     ) -> tuple[int, bool]:
         plan = self._plan_store.get(request.request_id)
         resolver = self._resolve_and_lease
-        import logging as _logging
-        import os as _os
-        _logging.warning(
-            "PROBE rpc_chain get_num_new_matched_tokens pid=%d req_id=%s "
-            "plan_found=%s resolver_set=%s store_id=%d",
-            _os.getpid(),
-            request.request_id,
-            plan is not None,
-            resolver is not None,
-            id(self._plan_store),
-        )
         if plan is None or resolver is None:
             return (0, False)
 
@@ -207,20 +196,7 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         return (record.matched_tokens, True)
 
     def update_state_after_alloc(self, request: Any, block_ids: list[int]) -> None:
-        import logging as _logging
-        record_before = self._binding_store.get(request.request_id)
-        result = self._binding_store.bind_target_blocks(request.request_id, block_ids)
-        record_after = self._binding_store.get(request.request_id)
-        _logging.warning(
-            "PROBE rpc_chain update_state_after_alloc req_id=%s block_ids_count=%d "
-            "pre_state=%s post_state=%s post_bound_blocks=%d post_is_transfer_ready=%s",
-            request.request_id,
-            len(block_ids),
-            getattr(record_before, "state", None) if record_before else None,
-            getattr(record_after, "state", None) if record_after else None,
-            len(getattr(record_after, "bound_blocks", ()) or ()) if record_after else 0,
-            getattr(record_after, "is_transfer_ready", False) if record_after else False,
-        )
+        self._binding_store.bind_target_blocks(request.request_id, block_ids)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -235,24 +211,9 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         # to avoid double-start, so we don't actually need scheduler_output
         # to dedupe.
         bindings: list[RemoteG2BindingRecord] = []
-        states_snapshot = []
         for request_id, record in self._binding_store.iter_records():
-            states_snapshot.append((
-                request_id,
-                getattr(record, "state", None),
-                bool(record.is_transfer_ready),
-            ))
             if record.is_transfer_ready:
                 bindings.append(record)
-        import logging as _logging
-        _logging.warning(
-            "PROBE rpc_chain build_connector_meta scanned=%d transfer_ready=%d states=%s "
-            "scheduler_output_size=%d",
-            len(states_snapshot),
-            len(bindings),
-            states_snapshot[:5],
-            len(scheduler_output.new_requests) + len(scheduler_output.cached_requests),
-        )
         return RemoteG2ConnectorMetadata(tuple(bindings))
 
     def request_finished(self, request: Any, cache_block_ids: list[int]) -> bool:
@@ -319,16 +280,6 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
 
     def start_load_kv(self, stream: Any) -> None:
         metadata = self.get_connector_meta()
-        import logging as _logging
-        _logging.warning(
-            "PROBE rpc_chain start_load_kv has_meta=%s bindings_count=%d "
-            "transfer_adapter=%s mark_local_valid=%s publish_binding=%s",
-            isinstance(metadata, RemoteG2ConnectorMetadata),
-            len(metadata.bindings) if isinstance(metadata, RemoteG2ConnectorMetadata) else 0,
-            "WIRED" if self._transfer_adapter is not None else "NONE",
-            "WIRED" if self._mark_local_valid is not None else "NONE",
-            "WIRED" if self._publish_binding is not None else "NONE",
-        )
         if not isinstance(metadata, RemoteG2ConnectorMetadata) or not metadata.bindings:
             return
         if self._transfer_adapter is None:

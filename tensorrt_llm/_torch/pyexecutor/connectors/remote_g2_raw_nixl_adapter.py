@@ -52,8 +52,12 @@ def build_raw_nixl_source_agent(
     try:
         config = nixl_agent_config(
             enable_prog_thread=True,
-            enable_listen_thread=True,
-            listen_port=0,  # OS-assigned
+            # Disable the listen thread to avoid metadata stream port
+            # conflicts when multiple NIXL agents coexist in the same
+            # pod (TP>1 or dynamo's own NIXL agent). We exchange agent
+            # metadata explicitly via add_remote_agent, not via NIXL's
+            # auto-discovery metadata stream.
+            enable_listen_thread=False,
             backends=["UCX"],
         )
         agent = nixl_agent(agent_name, config, instantiate_all=False)
@@ -103,6 +107,12 @@ def build_raw_nixl_source_agent(
     # fall back to the default 8888.
     listen_port = _extract_listen_port_from_metadata(metadata) or 8888
 
+    logging.info(
+        "[NIXL-XFER] source_agent_ready: agent=%s ip=%s port=%d "
+        "pool_base=0x%x pool_size=%d",
+        agent_name, local_ip, listen_port,
+        pool_base_ptr, pool_size_bytes,
+    )
     return _NixlSourceHandle(
         agent=agent,
         agent_name=agent_name,
@@ -163,8 +173,7 @@ class RawNixlRemoteG2Adapter:
 
         config = nixl_agent_config(
             enable_prog_thread=True,
-            enable_listen_thread=True,
-            listen_port=0,
+            enable_listen_thread=False,
             backends=["UCX"],
         )
         self._agent = nixl_agent(agent_name, config, instantiate_all=False)
@@ -189,6 +198,12 @@ class RawNixlRemoteG2Adapter:
             self._agent.register_memory(reg_list)
             self._primary_pool_base_ptr = primary_pool_base_ptr
             self._primary_pool_size_bytes = primary_pool_size_bytes
+            logging.info(
+                "[NIXL-XFER] target_agent_ready: agent=%s "
+                "vram_pool_base=0x%x vram_pool_size=%d device_id=%d",
+                agent_name, primary_pool_base_ptr,
+                primary_pool_size_bytes, self._device_id,
+            )
         except Exception:
             logging.exception(
                 "remote_g2: raw nixl primary pool register_memory failed "
@@ -203,15 +218,6 @@ class RawNixlRemoteG2Adapter:
         # because NIXL's make_prepped_xfer requires both local and
         # remote handles to come from prep_xfer_dlist.
         self._peer_handles: dict[tuple[str, int], tuple[Any, Any]] = {}
-
-        logging.warning(
-            "PROBE remote_g2_raw_target_adapter: agent_name=%s primary_pool_base=0x%x "
-            "primary_pool_size=%d device_id=%d",
-            agent_name,
-            primary_pool_base_ptr,
-            primary_pool_size_bytes,
-            device_id,
-        )
 
     def _ensure_peer_loaded(
         self,
@@ -244,6 +250,14 @@ class RawNixlRemoteG2Adapter:
                 "remote_g2: add_remote_agent returned %r but expected %r",
                 loaded_name, peer_name,
             )
+        logging.info(
+            "[NIXL-XFER] peer_loaded: local_agent=%s remote_agent=%s "
+            "remote_pool_base=0x%x remote_pool_size=%d device_id=%d",
+            self._agent_name, peer_name,
+            int(source_meta.get("pool_base_ptr", 0)),
+            int(source_meta.get("pool_size_bytes", 0)),
+            self._device_id,
+        )
 
         # Local dlist: covers our entire primary VRAM pool, indexed by
         # block. We pre-built block-aligned tuples so make_prepped_xfer's
@@ -286,11 +300,6 @@ class RawNixlRemoteG2Adapter:
         )
 
         self._peer_handles[key] = (local_handle, remote_handle)
-        logging.warning(
-            "PROBE remote_g2_raw_peer_loaded peer=%s gen=%d "
-            "local_blocks=%d remote_blocks=%d",
-            peer_name, peer_generation, num_blocks, remote_num_blocks,
-        )
         return local_handle, remote_handle
 
     def start_transfer(self, record):
@@ -329,14 +338,34 @@ class RawNixlRemoteG2Adapter:
             raise RuntimeError("remote G2 record has zero-sized blocks")
         self._block_size_bytes = block_size
 
+        # T3: Determine which source rank's metadata to use.
+        # With TP>1, each target rank loads its corresponding source
+        # rank's NIXL agent and uses that rank's descriptors.
+        from tensorrt_llm._utils import mpi_rank as _mpi_rank
+        my_rank = _mpi_rank()
+
+        resolve_result = record.resolve_result
+        per_rank_meta = getattr(resolve_result, "per_rank_source_metadata", {})
+        per_rank_descs = getattr(resolve_result, "per_rank_descriptors", {})
+
         # Source metadata — drives add_remote_agent + remote dlist.
         if _nvtx is not None:
             _nvtx.range_push("remote_g2 metadata fetch")
         try:
-            source_meta = self._source_metadata_fetcher(
-                record.plan.source_worker_id,
-                int(record.source_generation),
-            )
+            if per_rank_meta and my_rank in per_rank_meta:
+                # TP>1: use this rank's source metadata directly.
+                source_meta = per_rank_meta[my_rank]
+                logging.info(
+                    "remote_g2: T3 using per-rank metadata for tp_rank=%d "
+                    "(source=%s)",
+                    my_rank, source_meta.get("remote_name"),
+                )
+            else:
+                # TP=1 or fallback: fetch via RPC (rank 0's metadata).
+                source_meta = self._source_metadata_fetcher(
+                    record.plan.source_worker_id,
+                    int(record.source_generation),
+                )
         finally:
             if _nvtx is not None:
                 _nvtx.range_pop()
@@ -354,25 +383,63 @@ class RawNixlRemoteG2Adapter:
         # Build index arrays. Block indices into the local dlist =
         # target_block_id; into the remote dlist = source byte_offset
         # divided by block_size.
+        #
+        # T3: With TP>1, use per_rank_descriptors for this rank's
+        # source offsets. Fall back to bound_blocks' descriptors for
+        # TP=1 (where all descriptors are rank 0's).
         local_indices: list[int] = []
         remote_indices: list[int] = []
-        for block in record.bound_blocks:
-            # Use the primary-pool slot index (resolved at bind time) — NIXL's
-            # local dlist is dense over slots; block_ids are globally-unique
-            # engine identifiers that can exceed the slot count.
-            slot_idx = int(getattr(block, "target_slot_idx", -1))
-            if slot_idx < 0:
-                slot_idx = int(block.target_block_id)  # legacy fallback
-            local_indices.append(slot_idx)
-            src_offset = int(block.source_descriptor.byte_offset)
-            remote_indices.append(src_offset // block_size)
 
-        logging.warning(
-            "PROBE remote_g2_raw_make_prepped request_id=%s blocks=%d "
-            "local_head=%d remote_head=%d",
-            record.request_id, len(local_indices),
-            local_indices[0] if local_indices else -1,
-            remote_indices[0] if remote_indices else -1,
+        if per_rank_descs and my_rank in per_rank_descs:
+            # TP>1: this rank's descriptors from the per-rank gather.
+            rank_descs = per_rank_descs[my_rank]
+            for i, block in enumerate(record.bound_blocks):
+                slot_idx = int(getattr(block, "target_slot_idx", -1))
+                if slot_idx < 0:
+                    slot_idx = int(block.target_block_id)
+                local_indices.append(slot_idx)
+                if i < len(rank_descs) and rank_descs[i] is not None:
+                    src_offset = int(rank_descs[i].get("byte_offset", 0))
+                else:
+                    # Block not available in secondary tier on this rank.
+                    # Using rank 0's byte_offset would read from a
+                    # different rank's (possibly empty) secondary pool
+                    # causing data corruption.  Abort the transfer.
+                    raise RuntimeError(
+                        f"remote_g2: NIXL transfer aborted — source "
+                        f"rank {my_rank} does not have block {i} "
+                        f"(hash={getattr(block, 'source_block_hash', '?')}) "
+                        f"in secondary (host-pinned) tier. "
+                        f"rank_descs[{i}] is None; falling back to "
+                        f"rank 0's byte_offset would cause data "
+                        f"corruption. This indicates an asymmetric "
+                        f"offload across TP ranks — blocks were "
+                        f"offloaded to secondary on rank 0 but not "
+                        f"on rank {my_rank}."
+                    )
+                remote_indices.append(src_offset // block_size)
+        else:
+            # TP=1: use bound_blocks directly.
+            for block in record.bound_blocks:
+                slot_idx = int(getattr(block, "target_slot_idx", -1))
+                if slot_idx < 0:
+                    slot_idx = int(block.target_block_id)
+                local_indices.append(slot_idx)
+                src_offset = int(block.source_descriptor.byte_offset)
+                remote_indices.append(src_offset // block_size)
+
+        source_agent_name = source_meta.get("remote_name", "unknown")
+        logging.info(
+            "[NIXL-XFER] prep: request_id=%s tp_rank=%d blocks=%d "
+            "source_agent=%s local_indices=%s remote_indices=%s "
+            "block_size=%d device_id=%d",
+            record.request_id, my_rank, len(local_indices),
+            source_agent_name,
+            local_indices[:4] if len(local_indices) > 4
+            else local_indices,
+            remote_indices[:4] if len(remote_indices) > 4
+            else remote_indices,
+            block_size, self._device_id,
         )
 
         if _nvtx is not None:
@@ -401,11 +468,15 @@ class RawNixlRemoteG2Adapter:
         finally:
             if _nvtx is not None:
                 _nvtx.range_pop()
-        logging.warning(
-            "PROBE remote_g2_raw_transfer_submitted request_id=%s initial_state=%s",
-            record.request_id, state,
+        logging.info(
+            "[NIXL-XFER] submitted: request_id=%s tp_rank=%d "
+            "source_worker=%s source_agent=%s "
+            "blocks=%d initial_state=%s",
+            record.request_id, my_rank,
+            record.plan.source_worker_id,
+            source_agent_name,
+            len(local_indices), state,
         )
-
         return _RawNixlTransferResult(
             agent=self._agent,
             handle=handle,
@@ -419,25 +490,22 @@ class _RawNixlTransferResult:
     handle: Any
     record: Any
     _released: bool = False
-
-    _poll_count: int = 0
+    _logged_done: bool = False
 
     def is_completed(self) -> bool:
         state = self.agent.check_xfer_state(self.handle)
-        self._poll_count += 1
-        # Log first poll, every 100th, and any non-PROC state — keeps
-        # noise low while making completion visible.
         state_str = str(state).upper()
-        if (
-            self._poll_count == 1
-            or self._poll_count % 100 == 0
-            or state_str not in ("PROC", "PROCESSING", "PENDING")
-        ):
-            logging.warning(
-                "PROBE remote_g2_raw_is_completed request_id=%s poll=%d state=%s",
-                getattr(self.record, "request_id", "?"),
-                self._poll_count,
-                state_str,
+        if state_str in ("DONE", "SUCCESS") and not self._logged_done:
+            self._logged_done = True
+            logging.info(
+                "[NIXL-XFER] completed: request_id=%s state=%s",
+                self.record.request_id, state_str,
+            )
+        elif state_str in ("ERROR", "FAILED") and not self._logged_done:
+            self._logged_done = True
+            logging.error(
+                "[NIXL-XFER] FAILED: request_id=%s state=%s",
+                self.record.request_id, state_str,
             )
         return state_str in ("DONE", "SUCCESS")
 
