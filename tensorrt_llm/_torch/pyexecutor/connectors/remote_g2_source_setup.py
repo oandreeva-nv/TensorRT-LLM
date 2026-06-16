@@ -53,9 +53,74 @@ class _NixlSourceBundle:
 # get_metadata RPCs (Stage T2).
 _GLOBAL_NIXL_SOURCE_BUNDLE: Optional[_NixlSourceBundle] = None
 
+# Per-rank NIXL bundles gathered from all TP siblings at startup (S1).
+# Indexed by TP rank. TP=1 has a single entry at index 0.
+# Populated by _gather_per_rank_nixl_metadata() after each rank builds
+# its local NIXL agent.
+_GLOBAL_PER_RANK_NIXL_BUNDLES: Optional[list[dict]] = None
+
 
 def get_nixl_source_bundle() -> Optional[_NixlSourceBundle]:
     return _GLOBAL_NIXL_SOURCE_BUNDLE
+
+
+def get_per_rank_nixl_bundles() -> Optional[list[dict]]:
+    """Return the per-rank NIXL metadata list gathered at startup (S1).
+
+    Each entry is a dict with keys: remote_name, agent_metadata_b64,
+    pool_base_ptr, pool_size_bytes, source_generation, tp_rank.
+    Returns None if the gather hasn't completed or TP=1 hasn't been
+    initialized yet.
+    """
+    return _GLOBAL_PER_RANK_NIXL_BUNDLES
+
+
+def _gather_per_rank_nixl_metadata(
+    local_bundle: _NixlSourceBundle,
+    tp_rank: int,
+    tp_size: int,
+) -> list[dict]:
+    """S1: MPI allgather of per-rank NIXL agent metadata at startup.
+
+    Every TP rank contributes its own (agent_name, agent_desc,
+    pool_base_ptr, pool_size_bytes) and receives the full list.
+    Uses MPI world communicator (safe when DP OFF, i.e. world = TP group).
+
+    For DP ON deployments, this must be replaced with a TP-group-scoped
+    communicator to avoid cross-DP-group contamination.
+    """
+    import base64 as _b64
+
+    from tensorrt_llm._utils import mpi_allgather
+
+    local_entry = {
+        "tp_rank": tp_rank,
+        "remote_name": local_bundle.remote_name,
+        "agent_metadata_b64": _b64.b64encode(
+            local_bundle.agent_desc
+        ).decode("ascii"),
+        "pool_base_ptr": local_bundle.pool_base_ptr,
+        "pool_size_bytes": local_bundle.pool_size_bytes,
+        "source_generation": local_bundle.source_generation,
+    }
+
+    if tp_size <= 1:
+        return [local_entry]
+
+    # MPI allgather — every rank gets the full list.
+    all_entries = mpi_allgather(local_entry)
+    # Sort by tp_rank so indexing is deterministic.
+    all_entries.sort(key=lambda e: e["tp_rank"])
+
+    logging.warning(
+        "remote_g2: S1 per-rank NIXL metadata gathered: tp_size=%d "
+        "ranks=[%s]",
+        tp_size,
+        ", ".join(
+            f"{e['tp_rank']}:{e['remote_name']}" for e in all_entries
+        ),
+    )
+    return all_entries
 
 
 def _result_to_dict(result: Any) -> dict:
@@ -83,7 +148,7 @@ def _result_to_dict(result: Any) -> dict:
         }
         for s in (result.per_block_status or ())
     ]
-    return {
+    out = {
         "lease_id": result.lease_id,
         "descriptors": descriptors,
         "num_tokens": result.num_tokens,
@@ -91,22 +156,86 @@ def _result_to_dict(result: Any) -> dict:
         "source_generation": result.source_generation,
         "per_block_status": per_block_status,
     }
+    # S4: Include per-rank data when available (TP>1).
+    per_rank_descs = getattr(result, "per_rank_descriptors", {})
+    if per_rank_descs:
+        out["per_rank_descriptors"] = per_rank_descs
+    per_rank_meta = getattr(result, "per_rank_source_metadata", {})
+    if per_rank_meta:
+        out["per_rank_source_metadata"] = per_rank_meta
+    return out
 
 
-def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int) -> str:
-    """Start a ZMQ REP daemon thread bound to a Unix domain socket
-    tagged with the dynamo parent's PID. The dynamo parent process
-    constructs the matching REQ client using the same path. Returns
-    the socket path for logging.
+def _ipc_socket_path(dynamo_pid: int, tp_rank: int = 0, tp_size: int = 1) -> str:
+    """Return the ZMQ IPC socket path for a given TP rank.
 
-    Wire format: pickle-encoded {"method": <name>, "payload": <dict>}
-    request; pickle-encoded {"ok": bool, "result"|"error": <value>}
-    response. Pickle is safe here since both ends are colocated Python
-    processes on the same host.
+    TP=1: /tmp/dynamo_remote_g2_ipc_{pid}.sock (backward-compatible)
+    TP>1: /tmp/dynamo_remote_g2_ipc_{pid}_tp{rank}.sock (per-rank)
     """
-    import zmq  # imported lazily so this module stays importable on hosts without zmq
+    if tp_size <= 1:
+        return f"/tmp/dynamo_remote_g2_ipc_{dynamo_pid}.sock"
+    return f"/tmp/dynamo_remote_g2_ipc_{dynamo_pid}_tp{tp_rank}.sock"
 
-    socket_path = f"/tmp/dynamo_remote_g2_ipc_{dynamo_pid}.sock"
+
+def _query_sibling_rank(
+    dynamo_pid: int, sibling_rank: int, tp_size: int, block_hashes: list[int],
+) -> list[dict]:
+    """Query a sibling TP rank's ZMQ REP for descriptors via intra-pod IPC.
+
+    Returns a list of descriptor dicts (one per block_hash, None entries
+    for blocks not found on that rank). Sub-millisecond — Unix domain
+    socket on the same pod.
+    """
+    import zmq
+
+    sibling_path = _ipc_socket_path(dynamo_pid, sibling_rank, tp_size)
+    ctx = zmq.Context.instance()
+    req = ctx.socket(zmq.REQ)
+    req.RCVTIMEO = 5000
+    req.SNDTIMEO = 5000
+    try:
+        req.connect(f"ipc://{sibling_path}")
+        req.send(pickle.dumps({
+            "method": "resolve_hashes",
+            "payload": {"block_hashes": block_hashes},
+        }))
+        raw = req.recv()
+        resp = pickle.loads(raw)
+        if resp.get("ok"):
+            return resp.get("result", [])
+        logging.warning(
+            "remote_g2: sibling rank %d resolve_hashes returned not-ok: %s",
+            sibling_rank, resp.get("error"),
+        )
+        return []
+    except Exception:
+        logging.exception(
+            "remote_g2: sibling rank %d IPC query failed (path=%s)",
+            sibling_rank, sibling_path,
+        )
+        return []
+    finally:
+        req.close()
+
+
+def _start_zmq_rep_service(
+    registry: SourceG2DescriptorRegistry,
+    dynamo_pid: int,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+) -> str:
+    """Start a ZMQ REP daemon thread bound to a Unix domain socket.
+
+    Every TP rank binds its own socket (per-rank path). Rank 0's handler
+    serves external resolve RPCs AND queries sibling ranks via intra-pod
+    ZMQ IPC. Non-rank-0 handlers only serve intra-pod queries
+    (resolve_hashes method) from rank 0.
+
+    Returns the socket path for logging.
+    """
+    import zmq
+
+    socket_path = _ipc_socket_path(dynamo_pid, tp_rank, tp_size)
     try:
         os.unlink(socket_path)
     except FileNotFoundError:
@@ -128,9 +257,71 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
                 req = pickle.loads(raw)
                 method = req.get("method")
                 payload = req.get("payload") or {}
-                if method == "resolve_and_lease":
+                if method == "resolve_hashes":
+                    # Intra-pod query from rank 0: look up block hashes
+                    # on THIS rank's registry and return descriptors.
+                    hashes = payload.get("block_hashes", [])
+                    descs = []
+                    for bh in hashes:
+                        record = registry._lookup_via_find_block_by_hash(bh)
+                        if record is not None:
+                            descs.append({
+                                "block_hash": record.block_hash,
+                                "byte_offset": record.byte_offset,
+                                "byte_length": record.byte_length,
+                                "pool_id": record.pool_id,
+                                "metadata": dict(record.metadata or {}),
+                            })
+                        else:
+                            descs.append(None)
+                    response = {"ok": True, "result": descs}
+
+                elif method == "resolve_and_lease":
                     result = registry.resolve_and_lease(payload.get("plan"))
-                    response = {"ok": True, "result": _result_to_dict(result)}
+                    result_dict = _result_to_dict(result)
+
+                    # Intra-pod per-rank gather: query sibling ranks
+                    # via ZMQ IPC (no MPI, no dynamo RPC).
+                    if tp_size > 1 and result.reason == "ok" and result.descriptors:
+                        block_hashes = [
+                            d.block_hash for d in result.descriptors
+                        ]
+                        per_rank_descs = {tp_rank: [
+                            {
+                                "block_hash": d.block_hash,
+                                "byte_offset": d.byte_offset,
+                                "byte_length": d.byte_length,
+                                "pool_id": d.pool_id,
+                                "metadata": dict(d.metadata or {}),
+                            }
+                            for d in result.descriptors
+                        ]}
+                        # Query each sibling rank via local ZMQ IPC.
+                        for sibling in range(tp_size):
+                            if sibling == tp_rank:
+                                continue
+                            sibling_descs = _query_sibling_rank(
+                                dynamo_pid, sibling, tp_size, block_hashes,
+                            )
+                            if sibling_descs:
+                                per_rank_descs[sibling] = sibling_descs
+                        result_dict["per_rank_descriptors"] = per_rank_descs
+                        logging.info(
+                            "remote_g2: intra-pod gather: %d ranks, "
+                            "%d blocks each",
+                            len(per_rank_descs),
+                            len(block_hashes),
+                        )
+
+                        # Attach per-rank source metadata from S1.
+                        per_rank_bundles = get_per_rank_nixl_bundles()
+                        if per_rank_bundles:
+                            result_dict["per_rank_source_metadata"] = {
+                                entry["tp_rank"]: entry
+                                for entry in per_rank_bundles
+                            }
+
+                    response = {"ok": True, "result": result_dict}
                 elif method == "release_lease":
                     completed = registry.release_lease(
                         payload["lease_id"], payload.get("reason", "ack")
@@ -138,6 +329,7 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
                     response = {"ok": True, "result": completed}
                 elif method == "get_metadata":
                     bundle = get_nixl_source_bundle()
+                    per_rank = get_per_rank_nixl_bundles()
                     if bundle is None:
                         response = {
                             "ok": False,
@@ -147,10 +339,7 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
                         # Bidirectional peer load (raw NIXL): if the
                         # caller sent its serialized agent metadata,
                         # call add_remote_agent on it BEFORE returning
-                        # our own metadata. This is the equivalent of
-                        # the old load_remote_agent_by_connection
-                        # handshake but uses the bytes blob NIXL's raw
-                        # API expects.
+                        # our own metadata.
                         import base64 as _b64
                         peer_metadata_b64 = payload.get("peer_metadata_b64")
                         if peer_metadata_b64:
@@ -166,27 +355,23 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
                                 logging.exception(
                                     "remote_g2: source add_remote_agent failed"
                                 )
-                        response = {
-                            "ok": True,
-                            "result": {
-                                "source_worker_id": registry.source_worker_id,
-                                "source_dp_rank": registry.source_dp_rank,
-                                "source_generation": bundle.source_generation,
-                                "remote_name": bundle.remote_name,
-                                # Raw NIXL agent metadata bytes — target
-                                # passes this to its agent.add_remote_agent
-                                # and uses the rkeys it contains for the
-                                # prepped-flow dlist.
-                                "agent_metadata_b64": _b64.b64encode(
-                                    bundle.agent_desc
-                                ).decode("ascii"),
-                                # Pool extent so target can build a
-                                # block-indexed remote dlist that lines
-                                # up with the source's registered region.
-                                "pool_base_ptr": bundle.pool_base_ptr,
-                                "pool_size_bytes": bundle.pool_size_bytes,
-                            },
+                        # Rank 0's own metadata (backward-compatible with
+                        # TP=1 callers that don't read per_rank_metadata).
+                        result = {
+                            "source_worker_id": registry.source_worker_id,
+                            "source_dp_rank": registry.source_dp_rank,
+                            "source_generation": bundle.source_generation,
+                            "remote_name": bundle.remote_name,
+                            "agent_metadata_b64": _b64.b64encode(
+                                bundle.agent_desc
+                            ).decode("ascii"),
+                            "pool_base_ptr": bundle.pool_base_ptr,
+                            "pool_size_bytes": bundle.pool_size_bytes,
                         }
+                        # S5 — per-rank metadata for TP>1 targets.
+                        if per_rank is not None:
+                            result["per_rank_metadata"] = per_rank
+                        response = {"ok": True, "result": result}
                 else:
                     response = {"ok": False, "error": f"unknown method: {method!r}"}
             except Exception as exc:
@@ -225,10 +410,6 @@ def _walk_to_dynamo_worker_pid(max_depth: int = 10) -> Optional[int]:
         except (FileNotFoundError, PermissionError):
             my_cmdline = ""
         if "dynamo.trtllm" in my_cmdline or "dynamo/trtllm" in my_cmdline:
-            logging.warning(
-                "PROBE _walk_to_dynamo_worker_pid: current process IS dynamo "
-                "(TP=1 inline mode) pid=%d", my_pid,
-            )
             return my_pid
 
         # TP>1 path: walk ancestors to find the dynamo parent.
@@ -252,10 +433,6 @@ def _walk_to_dynamo_worker_pid(max_depth: int = 10) -> Optional[int]:
             except (FileNotFoundError, PermissionError):
                 cmdline = ""
             if "dynamo.trtllm" in cmdline or "dynamo/trtllm" in cmdline:
-                logging.warning(
-                    "PROBE _walk_to_dynamo_worker_pid: found dynamo parent "
-                    "ppid=%d from pid=%d", ppid, pid,
-                )
                 return ppid
             pid = ppid
         return None
@@ -276,33 +453,18 @@ def _resolve_source_identity() -> Optional[tuple[int, int]]:
     dynamo_pid = _walk_to_dynamo_worker_pid()
     env_value = os.environ.get("DYNAMO_REMOTE_G2_WORKER_ID")
     if env_value and dynamo_pid is not None:
-        logging.warning(
-            "PROBE _resolve_source_identity: env worker_id=%s dynamo_pid=%d",
-            env_value, dynamo_pid,
-        )
         try:
             return int(env_value), dynamo_pid
         except ValueError:
             pass
     if dynamo_pid is None:
-        logging.warning(
-            "PROBE _resolve_source_identity: dynamo_pid is None — "
-            "source registry will be skipped (need SYS_PTRACE + runAsUser:0)",
-        )
         return None
     sidecar = f"/tmp/dynamo_remote_g2_worker_{dynamo_pid}.txt"
     try:
         with open(sidecar) as f:
             worker_id = int(f.read().strip())
-        logging.warning(
-            "PROBE _resolve_source_identity: sidecar worker_id=%d dynamo_pid=%d",
-            worker_id, dynamo_pid,
-        )
         return worker_id, dynamo_pid
-    except Exception as exc:
-        logging.warning(
-            "PROBE _resolve_source_identity: sidecar read failed %r", exc,
-        )
+    except Exception:
         return None
 
 
@@ -431,17 +593,19 @@ def _setup_nixl_source_agent(
     pool_base_ptr: int,
     pool_size_bytes: int,
     source_worker_id: int,
+    tp_rank: int = 0,
+    tp_size: int = 1,
 ) -> Optional[_NixlSourceBundle]:
     """Build a raw nixl_agent on the source side and register the
     host_pinned secondary pool memory range so it can be read remotely.
 
-    Switched from TRT-LLM's BindingsNixlTransferAgent wrapper to raw
-    `nixl.nixl_agent` because the wrapper exposes only the combined
-    transfer flow (createXferReq → NIXL_ERR_NOT_FOUND for cross-process
-    READ). The prepped flow needed for proper rkey exchange requires
-    raw NIXL API surface.
+    With TP>1, each rank builds its own agent with a rank-qualified
+    name so peers can load multiple source agents (one per TP rank).
     """
-    agent_name = f"remote-g2-source-{source_worker_id}"
+    if tp_size > 1:
+        agent_name = f"remote-g2-source-{source_worker_id}-tp{tp_rank}"
+    else:
+        agent_name = f"remote-g2-source-{source_worker_id}"
     from .remote_g2_raw_nixl_adapter import build_raw_nixl_source_agent
 
     handle = build_raw_nixl_source_agent(
@@ -466,9 +630,138 @@ def _setup_nixl_source_agent(
     )
 
 
+# ─── S2: Per-rank descriptor gather on resolve ─────────────────────
+#
+# When TP>1, each rank holds its own slice of every KV block. On a
+# resolve RPC, rank 0 must gather per-rank descriptors from all TP
+# siblings so the target can issue per-rank NIXL READs.
+
+# Sentinel values for the sibling resolve loop (S3).
+_SIBLING_RESOLVE_TAG = "__remote_g2_resolve_hashes__"
+_SIBLING_SHUTDOWN_TAG = "__remote_g2_shutdown__"
+
+
+def _gather_per_rank_descriptors(
+    block_hashes: list[int],
+    local_registry: "SourceG2DescriptorRegistry",
+    tp_size: int,
+) -> dict[int, list[dict]]:
+    """S2: Rank 0 broadcasts block hashes, all ranks do local lookup,
+    rank 0 gathers per-rank descriptor lists.
+
+    Returns {tp_rank: [descriptor_dict, ...]} where each descriptor_dict
+    has keys matching the flat descriptor format (byte_offset, byte_length,
+    pool_id, block_hash, etc.).
+
+    For TP=1, returns {0: [local descriptors]}.
+    """
+    from tensorrt_llm._utils import mpi_allgather, mpi_broadcast
+
+    # Broadcast hashes from rank 0 to all ranks.
+    hashes = mpi_broadcast(block_hashes, root=0)
+
+    # Each rank resolves locally using its own registry. We use the
+    # internal find-and-pin path to get descriptors without creating
+    # a lease (the lease is managed by rank 0's resolve_and_lease).
+    local_descs = []
+    for bh in hashes:
+        record = local_registry._lookup_via_find_block_by_hash(bh)
+        if record is not None:
+            local_descs.append({
+                "block_hash": record.block_hash,
+                "byte_offset": record.byte_offset,
+                "byte_length": record.byte_length,
+                "pool_id": record.pool_id,
+                "metadata": record.metadata,
+            })
+        else:
+            # Block not found on this rank — signal with None.
+            local_descs.append(None)
+
+    # Gather from all ranks. Each rank contributes its descriptor list.
+    from tensorrt_llm._utils import mpi_rank
+    all_rank_descs = mpi_allgather({"tp_rank": mpi_rank(), "descs": local_descs})
+
+    # Assemble into {rank: descs} dict.
+    per_rank = {}
+    for entry in all_rank_descs:
+        per_rank[entry["tp_rank"]] = entry["descs"]
+
+    return per_rank
+
+
+def _start_sibling_rank_resolve_loop(
+    kv: Any,
+    registry: "SourceG2DescriptorRegistry",
+    tp_rank: int,
+    tp_size: int,
+) -> None:
+    """S3: Non-rank-0 TP siblings run a background thread that
+    participates in MPI collectives during resolve RPCs.
+
+    The loop blocks on mpi_broadcast (waiting for rank 0 to send
+    block hashes), does local findAndPinSecondaryBlockByHash, then
+    participates in the mpi_allgather back to rank 0.
+
+    Runs as a daemon thread so it doesn't block process shutdown.
+    """
+
+    def _loop():
+        from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
+
+        logging.info(
+            "remote_g2: S3 sibling resolve loop started on tp_rank=%d",
+            tp_rank,
+        )
+        while True:
+            try:
+                # Block until rank 0 broadcasts hashes (or shutdown).
+                hashes = mpi_broadcast(None, root=0)
+
+                if hashes == _SIBLING_SHUTDOWN_TAG:
+                    logging.info(
+                        "remote_g2: S3 sibling loop shutdown on tp_rank=%d",
+                        tp_rank,
+                    )
+                    return
+
+                # Local resolve for each hash.
+                local_descs = []
+                for bh in hashes:
+                    record = registry._lookup_via_find_block_by_hash(bh)
+                    if record is not None:
+                        local_descs.append({
+                            "block_hash": record.block_hash,
+                            "byte_offset": record.byte_offset,
+                            "byte_length": record.byte_length,
+                            "pool_id": record.pool_id,
+                            "metadata": record.metadata,
+                        })
+                    else:
+                        local_descs.append(None)
+
+                # Participate in the gather back to rank 0.
+                mpi_allgather({
+                    "tp_rank": mpi_rank(),
+                    "descs": local_descs,
+                })
+
+            except Exception:
+                logging.exception(
+                    "remote_g2: S3 sibling resolve loop error on tp_rank=%d",
+                    tp_rank,
+                )
+                # Don't exit on transient errors — keep looping.
+
+    t = threading.Thread(target=_loop, daemon=True, name=f"g2-sibling-{tp_rank}")
+    t.start()
+
+
 def maybe_start_remote_g2_service(
     kv: Any,
     *,
+    tp_rank: int = 0,
+    tp_size: int = 1,
     lease_ttl_ms: int = 30_000,
     pool_id: str = "g2-host-pinned",
     tier: str = "host_pinned",
@@ -490,6 +783,12 @@ def maybe_start_remote_g2_service(
       - DYNAMO_REMOTE_G2_WORKER_ID  (required; matches dynamo
         endpoint.connection_id() for the owning dynamo worker process)
       - DYNAMO_REMOTE_G2_DP_RANK    (defaults to 0)
+
+    TP>1 support (S1-S3):
+      - tp_rank / tp_size control MPI gather of per-rank NIXL metadata.
+      - Rank 0 runs the ZMQ REP server and answers resolve RPCs.
+      - Non-rank-0 ranks participate in MPI gather during resolve (S3)
+        but do NOT run a ZMQ server.
     """
     # Auto-detect tp_rank/tp_size from MPI when not passed explicitly.
     # This handles deployments where py_executor.py doesn't pass the
@@ -584,23 +883,33 @@ def maybe_start_remote_g2_service(
         pool_base_ptr,
     )
 
+    # ZMQ REP server — every rank binds its own socket for intra-pod
+    # IPC queries. Rank 0 serves external resolve RPCs from the dynamo
+    # parent AND queries sibling ranks via their sockets. Non-rank-0
+    # ranks serve only intra-pod resolve_hashes queries from rank 0.
     try:
-        socket_path = _start_zmq_rep_service(registry, dynamo_pid)
+        socket_path = _start_zmq_rep_service(
+            registry, dynamo_pid,
+            tp_rank=tp_rank, tp_size=tp_size,
+        )
         logging.warning(
-            "remote_g2: ZMQ REP service bound at %s (source_worker_id=%s)",
+            "remote_g2: ZMQ REP service bound at %s "
+            "(source_worker_id=%s tp_rank=%d tp_size=%d)",
             socket_path,
             source_worker_id,
+            tp_rank,
+            tp_size,
         )
     except Exception:
         logging.exception(
             "remote_g2: failed to start ZMQ REP service; registry built but "
-            "not reachable from dynamo parent"
+            "not reachable"
         )
 
     # Stage T1 — bootstrap the NIXL agent and register the host_pinned
-    # secondary pool. The bundle is stashed as a process-wide singleton
-    # so the ZMQ REP service can answer the get_metadata RPC (Stage T2)
-    # without threading the bundle through the registry constructor.
+    # secondary pool. Each TP rank builds its own agent with a rank-
+    # qualified name. The bundle is stashed as a process-wide singleton
+    # so the ZMQ REP service can answer the get_metadata RPC (Stage T2).
     pool_size_bytes = _pool_size_bytes(kv)
     if not pool_size_bytes or pool_size_bytes <= 0:
         logging.warning(
@@ -611,23 +920,42 @@ def maybe_start_remote_g2_service(
             pool_base_ptr=pool_base_ptr,
             pool_size_bytes=pool_size_bytes,
             source_worker_id=source_worker_id,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
         )
         if bundle is not None:
             global _GLOBAL_NIXL_SOURCE_BUNDLE
             _GLOBAL_NIXL_SOURCE_BUNDLE = bundle
             logging.warning(
-                "PROBE remote_g2_source_nixl: agent_name=%s pool_base_ptr=0x%x "
-                "pool_size=%d agent_desc_bytes=%d source_generation=%d",
+                "remote_g2: source NIXL agent built: agent_name=%s "
+                "pool_base_ptr=0x%x pool_size=%d tp_rank=%d",
                 bundle.remote_name,
                 bundle.pool_base_ptr,
                 bundle.pool_size_bytes,
-                len(bundle.agent_desc),
-                bundle.source_generation,
+                tp_rank,
             )
+
+            # S1 — gather per-rank NIXL metadata from all TP siblings.
+            # Every rank must participate (MPI allgather is collective).
+            try:
+                global _GLOBAL_PER_RANK_NIXL_BUNDLES
+                _GLOBAL_PER_RANK_NIXL_BUNDLES = (
+                    _gather_per_rank_nixl_metadata(
+                        bundle, tp_rank=tp_rank, tp_size=tp_size,
+                    )
+                )
+            except Exception:
+                logging.exception(
+                    "remote_g2: S1 per-rank metadata gather failed"
+                )
         else:
             logging.warning(
                 "remote_g2: NIXL source agent bootstrap failed; "
                 "resolve will still work, but transfer is disabled"
             )
+
+    # Per-rank resolve is now handled via intra-pod ZMQ IPC (no MPI).
+    # Each rank's ZMQ REP serves resolve_hashes queries from rank 0.
+    # No S3 sibling loop needed.
 
     return registry

@@ -196,25 +196,6 @@ class TargetRemotePlanStore:
             )
         except (TypeError, ValueError):
             return None
-        # PROBE: confirm the target worker received the plan and parsed the
-        # new kv_block_hashes field from the wire. Investigation-only.
-        import logging as _logging
-        import os as _os
-        _logging.warning(
-            "PROBE rpc_chain put_plan pid=%d trtllm_req_id=%s plan_id=%s "
-            "source=%s/%s target=%s/%s block_hashes_count=%d "
-            "kv_block_hashes_count=%d store_id=%d",
-            _os.getpid(),
-            trtllm_request_id,
-            parsed.plan_id,
-            parsed.source_worker_id,
-            parsed.source_dp_rank,
-            parsed.target_worker_id,
-            parsed.target_dp_rank,
-            len(parsed.block_hashes),
-            len(parsed.kv_block_hashes),
-            id(_GLOBAL_TARGET_PLAN_STORE),
-        )
         now_ms = self._clock_ms()
         if not parsed.is_remote_g2() or parsed.is_expired(now_ms):
             return None
@@ -367,6 +348,14 @@ class RemoteG2ResolveResult:
     reason: str = "ok"
     source_generation: int = 0
     per_block_status: tuple[RemoteG2BlockStatus, ...] = ()
+    # T1: Per-rank descriptors for TP>1. Keyed by tp_rank (int).
+    # Each value is a tuple of descriptors for that rank's KV slice.
+    # TP=1 callers can ignore this (empty dict).
+    per_rank_descriptors: dict = field(default_factory=dict)
+    # T2: Per-rank source metadata for TP>1. Keyed by tp_rank (int).
+    # Each value is a dict with keys: remote_name, agent_metadata_b64,
+    # pool_base_ptr, pool_size_bytes, source_generation.
+    per_rank_source_metadata: dict = field(default_factory=dict)
 
 
 class RemoteG2BindingState(str, Enum):
