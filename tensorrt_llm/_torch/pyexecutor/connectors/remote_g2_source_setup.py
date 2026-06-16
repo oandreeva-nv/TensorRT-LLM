@@ -209,9 +209,30 @@ def _walk_to_dynamo_worker_pid(max_depth: int = 10) -> Optional[int]:
     subprocess can't read DYNAMO_REMOTE_G2_WORKER_ID directly; this
     helper finds the dynamo parent so we can read a sidecar file
     /tmp/dynamo_remote_g2_worker_<pid>.txt instead.
+
+    When TP=1 (no MPI spawn), the engine runs inline in the dynamo
+    process itself — there is no parent to walk to. In that case we
+    check if the current process IS the dynamo process and return our
+    own PID.
     """
     try:
-        pid = os.getpid()
+        my_pid = os.getpid()
+        # TP=1 fast path: check if *this* process is the dynamo worker
+        # (no MPI subprocess when tensor_parallel_size == 1).
+        try:
+            with open(f"/proc/{my_pid}/cmdline") as f:
+                my_cmdline = f.read().replace("\0", " ")
+        except (FileNotFoundError, PermissionError):
+            my_cmdline = ""
+        if "dynamo.trtllm" in my_cmdline or "dynamo/trtllm" in my_cmdline:
+            logging.warning(
+                "PROBE _walk_to_dynamo_worker_pid: current process IS dynamo "
+                "(TP=1 inline mode) pid=%d", my_pid,
+            )
+            return my_pid
+
+        # TP>1 path: walk ancestors to find the dynamo parent.
+        pid = my_pid
         for _ in range(max_depth):
             try:
                 with open(f"/proc/{pid}/status") as f:
@@ -223,14 +244,18 @@ def _walk_to_dynamo_worker_pid(max_depth: int = 10) -> Optional[int]:
                 if line.startswith("PPid:"):
                     ppid = int(line.split()[1])
                     break
-            if ppid is None or ppid <= 1:
+            if ppid is None or ppid < 1:
                 return None
             try:
                 with open(f"/proc/{ppid}/cmdline") as f:
                     cmdline = f.read().replace("\0", " ")
             except (FileNotFoundError, PermissionError):
                 cmdline = ""
-            if "dynamo.trtllm" in cmdline:
+            if "dynamo.trtllm" in cmdline or "dynamo/trtllm" in cmdline:
+                logging.warning(
+                    "PROBE _walk_to_dynamo_worker_pid: found dynamo parent "
+                    "ppid=%d from pid=%d", ppid, pid,
+                )
                 return ppid
             pid = ppid
         return None
@@ -251,38 +276,59 @@ def _resolve_source_identity() -> Optional[tuple[int, int]]:
     dynamo_pid = _walk_to_dynamo_worker_pid()
     env_value = os.environ.get("DYNAMO_REMOTE_G2_WORKER_ID")
     if env_value and dynamo_pid is not None:
+        logging.warning(
+            "PROBE _resolve_source_identity: env worker_id=%s dynamo_pid=%d",
+            env_value, dynamo_pid,
+        )
         try:
             return int(env_value), dynamo_pid
         except ValueError:
             pass
     if dynamo_pid is None:
+        logging.warning(
+            "PROBE _resolve_source_identity: dynamo_pid is None — "
+            "source registry will be skipped (need SYS_PTRACE + runAsUser:0)",
+        )
         return None
     sidecar = f"/tmp/dynamo_remote_g2_worker_{dynamo_pid}.txt"
     try:
         with open(sidecar) as f:
-            return int(f.read().strip()), dynamo_pid
-    except Exception:
+            worker_id = int(f.read().strip())
+        logging.warning(
+            "PROBE _resolve_source_identity: sidecar worker_id=%d dynamo_pid=%d",
+            worker_id, dynamo_pid,
+        )
+        return worker_id, dynamo_pid
+    except Exception as exc:
+        logging.warning(
+            "PROBE _resolve_source_identity: sidecar read failed %r", exc,
+        )
         return None
+
+
+def _get_secondary_pool(kv: Any) -> Any:
+    """Return the unsliced secondary pool tensor, falling back to
+    get_secondary_pool_data(0) on older TRT-LLM builds that lack
+    get_unique_secondary_pool().
+    """
+    if hasattr(kv, "get_unique_secondary_pool"):
+        return kv.get_unique_secondary_pool()
+    # Fallback: layer-0 slice — data_ptr coincides with allocation base
+    # under block-major layout (the standard for transformer models).
+    return kv.get_secondary_pool_data(0)
 
 
 def _secondary_pool_base_ptr(kv: Any) -> int:
     """Return the secondary KV cache pool's base host address, or 0 when
     not available (no host pool allocated, exposure binding missing, etc.).
-
-    Uses get_unique_secondary_pool() — the unsliced full pool tensor —
-    so the base pointer is unambiguous regardless of layout. The earlier
-    get_secondary_pool_data(0) path returned a per-layer slice whose
-    data_ptr() happened to coincide with the allocation base under
-    block-major layout, but would silently point at the wrong address
-    for a layer-first layout.
     """
     try:
-        pool = kv.get_unique_secondary_pool()
+        pool = _get_secondary_pool(kv)
         if pool is None or pool.numel() == 0:
             return 0
         return int(pool.data_ptr())
     except Exception as exc:
-        logging.warning("remote_g2: get_unique_secondary_pool raised: %r", exc)
+        logging.warning("remote_g2: _get_secondary_pool raised: %r", exc)
         return 0
 
 
@@ -304,12 +350,13 @@ def _derive_block_size_bytes(kv: Any) -> Optional[int]:
     fail-loud rather than a silent corruption.
     """
     try:
-        pool = kv.get_unique_secondary_pool()
+        pool = _get_secondary_pool(kv)
     except Exception:
         return None
     if pool is None or pool.numel() == 0 or pool.ndim < 2:
         return None
 
+    used_fallback = not hasattr(kv, "get_unique_secondary_pool")
     per_block_elems = 1
     for d in pool.shape[1:]:
         per_block_elems *= int(d)
@@ -318,7 +365,19 @@ def _derive_block_size_bytes(kv: Any) -> Optional[int]:
 
     per_block_bytes = int(pool.element_size()) * per_block_elems
 
+    # When using get_secondary_pool_data(0) fallback, the tensor is a
+    # per-layer slice — multiply by num_pools (== num_layers) to get
+    # the full logical block size across all layers.
+    if used_fallback:
+        try:
+            num_pools = int(kv.num_pools)
+        except Exception:
+            return None
+        per_block_bytes *= num_pools
+
     total_bytes = int(pool.element_size()) * int(pool.numel())
+    if used_fallback:
+        total_bytes *= num_pools
     if total_bytes % per_block_bytes != 0:
         return None
 
@@ -353,12 +412,19 @@ def _pool_size_bytes(kv: Any) -> Optional[int]:
     needing to multiply by num_layers manually.
     """
     try:
-        pool = kv.get_unique_secondary_pool()
+        pool = _get_secondary_pool(kv)
     except Exception:
         return None
     if pool is None or pool.numel() == 0:
         return None
-    return int(pool.element_size() * pool.numel())
+    size = int(pool.element_size() * pool.numel())
+    # Fallback pool is per-layer; multiply by num_pools for full size.
+    if not hasattr(kv, "get_unique_secondary_pool"):
+        try:
+            size *= int(kv.num_pools)
+        except Exception:
+            return None
+    return size
 
 
 def _setup_nixl_source_agent(
@@ -425,6 +491,25 @@ def maybe_start_remote_g2_service(
         endpoint.connection_id() for the owning dynamo worker process)
       - DYNAMO_REMOTE_G2_DP_RANK    (defaults to 0)
     """
+    # Auto-detect tp_rank/tp_size from MPI when not passed explicitly.
+    # This handles deployments where py_executor.py doesn't pass the
+    # TP info (e.g. patched connectors without patched py_executor).
+    if tp_rank == 0 and tp_size == 1:
+        try:
+            from tensorrt_llm._utils import mpi_rank, mpi_world_size
+            detected_rank = mpi_rank()
+            detected_size = mpi_world_size()
+            if detected_size > 1:
+                tp_rank = detected_rank
+                tp_size = detected_size
+                logging.warning(
+                    "remote_g2: auto-detected TP from MPI: "
+                    "tp_rank=%d tp_size=%d",
+                    tp_rank, tp_size,
+                )
+        except Exception:
+            pass
+
     identity = _resolve_source_identity()
     if identity is None:
         logging.info(
