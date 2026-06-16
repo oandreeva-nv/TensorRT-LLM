@@ -995,7 +995,21 @@ class KVCacheManager(BaseResourceManager):
                        request.prompt_len,
                        getattr(request, 'context_remaining_length', -1)),
                     flush=True)
-            self.impl.store_context_blocks(request)
+            # Fix B: guard against benign race where the request's
+            # sequence was already freed (store_blocks_for_reuse /
+            # termination removed it) before this async callback fires.
+            # The trie_store already captured KV data before the
+            # sequence was freed, so the "Can not find sequence" C++
+            # warning is safe to suppress.
+            try:
+                self.impl.store_context_blocks(request)
+            except Exception:
+                if _KV_OFFLOAD_DIAG:
+                    print(
+                        "[KV_DIAG] rank=%d store_context_blocks "
+                        "SKIPPED req_id=%d (sequence already freed)"
+                        % (mpi_rank(), request.py_request_id),
+                        flush=True)
             if _KV_OFFLOAD_DIAG:
                 print(
                     "[KV_DIAG] rank=%d DONE store_context_blocks "
