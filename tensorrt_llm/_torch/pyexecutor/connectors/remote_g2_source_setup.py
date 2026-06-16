@@ -218,6 +218,46 @@ def _query_sibling_rank(
         req.close()
 
 
+def _release_sibling_hashes(
+    dynamo_pid: int, sibling_rank: int, tp_size: int, block_hashes: list[int],
+) -> int:
+    """Send release_hashes to a sibling TP rank's ZMQ REP via intra-pod IPC.
+
+    Returns the number of blocks successfully unpinned on the sibling.
+    Fire-and-forget semantics: failures are logged but do not propagate.
+    """
+    import zmq
+
+    sibling_path = _ipc_socket_path(dynamo_pid, sibling_rank, tp_size)
+    ctx = zmq.Context.instance()
+    req = ctx.socket(zmq.REQ)
+    req.RCVTIMEO = 5000
+    req.SNDTIMEO = 5000
+    try:
+        req.connect(f"ipc://{sibling_path}")
+        req.send(pickle.dumps({
+            "method": "release_hashes",
+            "payload": {"block_hashes": block_hashes},
+        }))
+        raw = req.recv()
+        resp = pickle.loads(raw)
+        if resp.get("ok"):
+            return resp.get("result", 0)
+        logging.warning(
+            "remote_g2: sibling rank %d release_hashes returned not-ok: %s",
+            sibling_rank, resp.get("error"),
+        )
+        return 0
+    except Exception:
+        logging.exception(
+            "remote_g2: sibling rank %d release_hashes IPC failed (path=%s)",
+            sibling_rank, sibling_path,
+        )
+        return 0
+    finally:
+        req.close()
+
+
 def _start_zmq_rep_service(
     registry: SourceG2DescriptorRegistry,
     dynamo_pid: int,
@@ -245,6 +285,13 @@ def _start_zmq_rep_service(
     rep = ctx.socket(zmq.REP)
     rep.bind(f"ipc://{socket_path}")
 
+    # Track blocks pinned by resolve_hashes on sibling ranks so that
+    # release_hashes can unpin them later.  Keyed by block_hash →
+    # list[block_id]; list handles concurrent resolves that pin the
+    # same hash more than once.
+    from collections import defaultdict
+    sibling_pin_tracker: dict[int, list[int]] = defaultdict(list)
+
     def _loop() -> None:
         while True:
             method = "<unparsed>"
@@ -260,25 +307,178 @@ def _start_zmq_rep_service(
                 if method == "resolve_hashes":
                     # Intra-pod query from rank 0: look up block hashes
                     # on THIS rank's registry and return descriptors.
+                    # Uses the batch tier-aware lookup which reports
+                    # primary-only blocks as CacheMiss(found_tier="primary").
+                    from .remote_g2 import PinnedCacheBlock, CacheMiss
                     hashes = payload.get("block_hashes", [])
+                    lookup_results = registry._find_and_pin_blocks_by_hash(
+                        tuple(int(h) for h in hashes)
+                    )
                     descs = []
-                    for bh in hashes:
-                        record = registry._lookup_via_find_block_by_hash(bh)
-                        if record is not None:
+                    pinned_count = 0
+                    primary_count = 0
+                    missing_count = 0
+                    # Collect indices of blocks that are in primary but
+                    # not secondary — candidates for force-offload.
+                    primary_only_indices = []
+                    for idx, lr in enumerate(lookup_results):
+                        if isinstance(lr, PinnedCacheBlock):
+                            byte_offset = int(lr.slot_idx) * registry._block_size_bytes
                             descs.append({
-                                "block_hash": record.block_hash,
-                                "byte_offset": record.byte_offset,
-                                "byte_length": record.byte_length,
-                                "pool_id": record.pool_id,
-                                "metadata": dict(record.metadata or {}),
+                                "block_hash": lr.block_hash,
+                                "byte_offset": byte_offset,
+                                "byte_length": registry._block_size_bytes,
+                                "pool_id": registry._pool_id,
+                                "metadata": {
+                                    "nixl_memory_desc": {
+                                        "ptr": registry._pool_base_ptr + byte_offset,
+                                        "len": registry._block_size_bytes,
+                                    }
+                                },
                             })
+                            # Track pin so release_hashes can unpin later.
+                            sibling_pin_tracker[lr.block_hash].append(
+                                int(lr.block_id)
+                            )
+                            pinned_count += 1
                         else:
                             descs.append(None)
+                            if isinstance(lr, CacheMiss) and lr.found_tier == "primary":
+                                primary_only_indices.append(idx)
+                                primary_count += 1
+                            else:
+                                missing_count += 1
+
+                    # Force-offload blocks stuck in primary to secondary
+                    # and pin them. This ensures TP>1 symmetric secondary
+                    # availability for NIXL RDMA transfers.
+                    if primary_only_indices and registry._window_size is not None:
+                        force_hashes = [
+                            int(hashes[i]) for i in primary_only_indices
+                        ]
+                        try:
+                            force_results = registry._kv.force_offload_and_pin_blocks_by_hash(
+                                force_hashes,
+                                int(registry._window_size),
+                            )
+                            force_ok = 0
+                            for fi, fr in zip(primary_only_indices, force_results):
+                                if bool(fr.get("pinned", False)):
+                                    slot_idx = int(fr["slot_idx"])
+                                    byte_offset = slot_idx * registry._block_size_bytes
+                                    descs[fi] = {
+                                        "block_hash": int(fr["block_hash"]),
+                                        "byte_offset": byte_offset,
+                                        "byte_length": registry._block_size_bytes,
+                                        "pool_id": registry._pool_id,
+                                        "metadata": {
+                                            "nixl_memory_desc": {
+                                                "ptr": registry._pool_base_ptr + byte_offset,
+                                                "len": registry._block_size_bytes,
+                                            }
+                                        },
+                                    }
+                                    sibling_pin_tracker[int(fr["block_hash"])].append(
+                                        int(fr["block_id"])
+                                    )
+                                    pinned_count += 1
+                                    primary_count -= 1
+                                    force_ok += 1
+                            logging.info(
+                                "remote_g2: resolve_hashes: tp_rank=%d "
+                                "force_offload attempted=%d succeeded=%d",
+                                tp_rank, len(force_hashes), force_ok,
+                            )
+                        except Exception as e:
+                            logging.warning(
+                                "remote_g2: resolve_hashes: tp_rank=%d "
+                                "force_offload failed: %s",
+                                tp_rank, e,
+                            )
+                    # Pad remaining hashes with None if stop_on_miss
+                    # truncated the results.
+                    while len(descs) < len(hashes):
+                        descs.append(None)
+                    # Diagnostic: log secondary pool utilization to
+                    # confirm whether blocks exist in secondary on
+                    # this rank.
+                    _sec_diag = ""
+                    try:
+                        _iter_stats = registry._kv.get_iteration_stats()
+                        for _ws, _st in _iter_stats.items():
+                            _sec_diag += (
+                                f" ws={_ws}:sec_used={_st.secondary_used_num_blocks}"
+                                f"/sec_free={_st.secondary_free_num_blocks}"
+                                f"/sec_max={_st.secondary_max_num_blocks}"
+                                f"/pri_used={_st.primary_used_num_blocks}"
+                                f"/pri_free={_st.primary_free_num_blocks}"
+                            )
+                    except Exception as _e:
+                        _sec_diag = f" (stats unavailable: {_e})"
+                    logging.info(
+                        "remote_g2: resolve_hashes: tp_rank=%d "
+                        "hashes=%d pinned=%d in_primary=%d "
+                        "missing=%d tracker_size=%d%s",
+                        tp_rank, len(hashes), pinned_count,
+                        primary_count, missing_count,
+                        sum(len(v) for v in sibling_pin_tracker.values()),
+                        _sec_diag,
+                    )
                     response = {"ok": True, "result": descs}
+
+                elif method == "release_hashes":
+                    # Intra-pod unpin from rank 0: unpin blocks that
+                    # were pinned during an earlier resolve_hashes call.
+                    hashes = payload.get("block_hashes", [])
+                    logging.info(
+                        "remote_g2: release_hashes: tp_rank=%d "
+                        "incoming=%d tracker_keys=%d tracker_total=%d",
+                        tp_rank, len(hashes),
+                        len(sibling_pin_tracker),
+                        sum(len(v) for v in sibling_pin_tracker.values()),
+                    )
+                    unpinned = 0
+                    for bh in hashes:
+                        ids = sibling_pin_tracker.get(bh)
+                        if ids:
+                            block_id = ids.pop(0)
+                            registry._release_pin_ref(block_id)
+                            unpinned += 1
+                            if not ids:
+                                del sibling_pin_tracker[bh]
+                    logging.info(
+                        "remote_g2: release_hashes: unpinned %d/%d "
+                        "blocks on tp_rank=%d",
+                        unpinned, len(hashes), tp_rank,
+                    )
+                    response = {"ok": True, "result": unpinned}
 
                 elif method == "resolve_and_lease":
                     result = registry.resolve_and_lease(payload.get("plan"))
                     result_dict = _result_to_dict(result)
+
+                    # Diagnostic: log secondary pool stats on rank 0
+                    # for comparison with sibling ranks.
+                    _r0_diag = ""
+                    try:
+                        _r0_stats = registry._kv.get_iteration_stats()
+                        for _ws, _st in _r0_stats.items():
+                            _r0_diag += (
+                                f" ws={_ws}:sec_used={_st.secondary_used_num_blocks}"
+                                f"/sec_free={_st.secondary_free_num_blocks}"
+                                f"/sec_max={_st.secondary_max_num_blocks}"
+                                f"/pri_used={_st.primary_used_num_blocks}"
+                                f"/pri_free={_st.primary_free_num_blocks}"
+                            )
+                    except Exception as _e:
+                        _r0_diag = f" (stats unavailable: {_e})"
+                    logging.info(
+                        "remote_g2: resolve_and_lease: tp_rank=%d "
+                        "reason=%s n_descs=%d%s",
+                        tp_rank, result.reason,
+                        len(result.descriptors) if result.descriptors else 0,
+                        _r0_diag,
+                    )
 
                     # Intra-pod per-rank gather: query sibling ranks
                     # via ZMQ IPC (no MPI, no dynamo RPC).
@@ -305,10 +505,49 @@ def _start_zmq_rep_service(
                             )
                             if sibling_descs:
                                 per_rank_descs[sibling] = sibling_descs
+                        # Validate: every TP rank must have ALL blocks
+                        # available in the secondary (host-pinned) tier.
+                        # If any rank is missing blocks (None entries),
+                        # the target would read from an empty secondary
+                        # pool → data corruption.
+                        missing_ranks = []
+                        for rank_id in range(tp_size):
+                            if rank_id not in per_rank_descs:
+                                missing_ranks.append(
+                                    (rank_id, "not_queried"))
+                                continue
+                            rd = per_rank_descs[rank_id]
+                            none_indices = [
+                                j for j, d in enumerate(rd)
+                                if d is None
+                            ]
+                            if none_indices:
+                                missing_ranks.append(
+                                    (rank_id, f"blocks_not_in_secondary:"
+                                     f"{none_indices[:8]}"))
+                        if missing_ranks:
+                            logging.warning(
+                                "remote_g2: resolve_and_lease FAILED — "
+                                "asymmetric secondary offload across TP "
+                                "ranks. Ranks with missing blocks: %s. "
+                                "Returning cache_miss to force fallback.",
+                                missing_ranks,
+                            )
+                            # Override the result to signal cache miss
+                            # so the target doesn't attempt a partial
+                            # transfer with wrong offsets.
+                            result_dict["reason"] = "cache_miss"
+                            result_dict["descriptors"] = None
+                            result_dict["per_rank_descriptors"] = None
+                            response = {
+                                "ok": True, "result": result_dict}
+                            rep.send(pickle.dumps(response))
+                            continue
+
                         result_dict["per_rank_descriptors"] = per_rank_descs
                         logging.info(
                             "remote_g2: intra-pod gather: %d ranks, "
-                            "%d blocks each",
+                            "%d blocks each — all ranks validated",
                             len(per_rank_descs),
                             len(block_hashes),
                         )
@@ -323,9 +562,31 @@ def _start_zmq_rep_service(
 
                     response = {"ok": True, "result": result_dict}
                 elif method == "release_lease":
-                    completed = registry.release_lease(
-                        payload["lease_id"], payload.get("reason", "ack")
+                    lease_id = payload["lease_id"]
+                    reason = payload.get("reason", "ack")
+                    # Grab block_hashes BEFORE release consumes the lease,
+                    # so we can fan out unpin to sibling ranks.
+                    lease = registry.get_lease(lease_id)
+                    block_hashes_to_release = (
+                        list(lease.block_hashes)
+                        if lease is not None else []
                     )
+                    completed = registry.release_lease(lease_id, reason)
+                    # Fan out unpin to sibling ranks (TP>1 only).
+                    if completed and tp_size > 1 and block_hashes_to_release:
+                        for sibling in range(tp_size):
+                            if sibling == tp_rank:
+                                continue
+                            _release_sibling_hashes(
+                                dynamo_pid, sibling, tp_size,
+                                block_hashes_to_release,
+                            )
+                        logging.info(
+                            "remote_g2: release fan-out: lease=%s, "
+                            "%d hashes to %d siblings",
+                            lease_id, len(block_hashes_to_release),
+                            tp_size - 1,
+                        )
                     response = {"ok": True, "result": completed}
                 elif method == "get_metadata":
                     bundle = get_nixl_source_bundle()

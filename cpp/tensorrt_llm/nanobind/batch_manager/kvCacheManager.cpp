@@ -761,6 +761,40 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("block_hashes"), nb::arg("window_size"), nb::arg("tier") = "host_pinned",
             nb::arg("stop_on_miss") = true)
         .def(
+            "force_offload_and_pin_blocks_by_hash",
+            [](BaseKVCacheManager& self, std::vector<size_t> const& block_hashes, SizeType32 window_size)
+            {
+                auto results = self.forceOffloadAndPinBlocksByHash(block_hashes, window_size);
+                nb::list pyResults;
+                for (auto const& result : results)
+                {
+                    nb::dict item;
+                    item["block_hash"] = result.blockHash;
+                    item["pinned"] = result.pinned;
+                    if (result.foundTier)
+                    {
+                        item["found_tier"] = cachePoolTierToString(*result.foundTier);
+                    }
+                    else
+                    {
+                        item["found_tier"] = nb::none();
+                    }
+                    if (result.pinned)
+                    {
+                        item["block_id"] = result.blockId;
+                        item["slot_idx"] = result.slotIdx;
+                    }
+                    else
+                    {
+                        item["block_id"] = nb::none();
+                        item["slot_idx"] = nb::none();
+                    }
+                    pyResults.append(item);
+                }
+                return pyResults;
+            },
+            nb::arg("block_hashes"), nb::arg("window_size"))
+        .def(
             "get_slot_idx_by_block_id",
             [](BaseKVCacheManager& self, tbk::KVCacheBlock::IdType block_id, SizeType32 window_size)
             {

@@ -755,6 +755,247 @@ def test_remote_g2_duplicate_and_reordered_callbacks_are_idempotent():
     assert released == [("lease-idempotent", "transfer_failed")]
 
 
+def test_resolve_hashes_force_offloads_primary_only_blocks():
+    """Simulate the resolve_hashes IPC handler's force-offload retry path.
+
+    When find_and_pin_blocks_by_hash reports blocks in primary but not
+    secondary (CacheMiss with found_tier="primary"), the handler should
+    call force_offload_and_pin_blocks_by_hash to move them to secondary
+    and fill in descriptors. This prevents asymmetric secondary-tier
+    availability across TP ranks during NIXL RDMA transfers.
+    """
+    from tensorrt_llm._torch.pyexecutor.connectors.remote_g2 import (
+        CacheMiss,
+        PinnedCacheBlock,
+    )
+
+    BLOCK_SIZE_BYTES = 4096
+    POOL_BASE_PTR = 0x2000_0000
+    WINDOW_SIZE = 4096
+
+    # Simulate: blocks 11 and 22 are in primary only, block 33 is missing.
+    find_calls = []
+    force_calls = []
+
+    class FakeKv:
+        def find_and_pin_blocks_by_hash(
+            self, block_hashes, window_size, tier="host_pinned", stop_on_miss=True
+        ):
+            find_calls.append(list(block_hashes))
+            results = []
+            for bh in block_hashes:
+                results.append({
+                    "block_hash": int(bh),
+                    "pinned": False,
+                    "found_tier": "primary",
+                    "block_id": None,
+                    "slot_idx": None,
+                })
+                if stop_on_miss:
+                    # In practice, stop_on_miss=True stops at first miss.
+                    # But CacheMiss(found_tier="primary") is not a full miss,
+                    # so the handler iterates all results.
+                    pass
+            return results
+
+        def force_offload_and_pin_blocks_by_hash(self, block_hashes, window_size):
+            force_calls.append(list(block_hashes))
+            # Simulate successful force-offload for all requested hashes.
+            results = []
+            for i, bh in enumerate(block_hashes):
+                results.append({
+                    "block_hash": int(bh),
+                    "pinned": True,
+                    "found_tier": "host_pinned",
+                    "block_id": 100 + i,
+                    "slot_idx": 50 + i,
+                })
+            return results
+
+    kv = FakeKv()
+
+    # Reproduce the resolve_hashes handler logic (from remote_g2_source_setup.py).
+    hashes = [11, 22, 33]
+    registry_window_size = WINDOW_SIZE
+    registry_block_size_bytes = BLOCK_SIZE_BYTES
+    registry_pool_id = "host-pool-0"
+    registry_pool_base_ptr = POOL_BASE_PTR
+
+    # Step 1: Initial lookup via _find_and_pin_blocks_by_hash pattern.
+    raw_results = kv.find_and_pin_blocks_by_hash(
+        [int(h) for h in hashes],
+        int(registry_window_size),
+        tier="host_pinned",
+        stop_on_miss=True,
+    )
+
+    descs = []
+    pinned_count = 0
+    primary_only_indices = []
+    for idx, raw in enumerate(raw_results):
+        if bool(raw.get("pinned", False)):
+            slot_idx = int(raw["slot_idx"])
+            byte_offset = slot_idx * registry_block_size_bytes
+            descs.append({
+                "block_hash": int(raw["block_hash"]),
+                "byte_offset": byte_offset,
+                "byte_length": registry_block_size_bytes,
+                "pool_id": registry_pool_id,
+            })
+            pinned_count += 1
+        else:
+            descs.append(None)
+            if raw.get("found_tier") == "primary":
+                primary_only_indices.append(idx)
+
+    # Step 2: Force-offload retry for primary-only blocks.
+    assert len(primary_only_indices) == 3, "all 3 blocks should be primary-only"
+    assert pinned_count == 0
+
+    if primary_only_indices and registry_window_size is not None:
+        force_hashes = [int(hashes[i]) for i in primary_only_indices]
+        force_results = kv.force_offload_and_pin_blocks_by_hash(
+            force_hashes,
+            int(registry_window_size),
+        )
+        force_ok = 0
+        for fi, fr in zip(primary_only_indices, force_results):
+            if bool(fr.get("pinned", False)):
+                slot_idx = int(fr["slot_idx"])
+                byte_offset = slot_idx * registry_block_size_bytes
+                descs[fi] = {
+                    "block_hash": int(fr["block_hash"]),
+                    "byte_offset": byte_offset,
+                    "byte_length": registry_block_size_bytes,
+                    "pool_id": registry_pool_id,
+                    "metadata": {
+                        "nixl_memory_desc": {
+                            "ptr": registry_pool_base_ptr + byte_offset,
+                            "len": registry_block_size_bytes,
+                        }
+                    },
+                }
+                pinned_count += 1
+                force_ok += 1
+
+    # Verify: all 3 blocks should now have descriptors filled in.
+    assert pinned_count == 3
+    assert force_ok == 3
+    assert all(d is not None for d in descs)
+
+    # Verify the force-offload was called with the correct hashes.
+    assert force_calls == [[11, 22, 33]]
+
+    # Verify byte_offset calculation: slot 50 * 4096, slot 51 * 4096, slot 52 * 4096.
+    assert descs[0]["byte_offset"] == 50 * BLOCK_SIZE_BYTES
+    assert descs[1]["byte_offset"] == 51 * BLOCK_SIZE_BYTES
+    assert descs[2]["byte_offset"] == 52 * BLOCK_SIZE_BYTES
+
+    # Verify nixl_memory_desc ptr = pool_base + byte_offset.
+    for d in descs:
+        assert d["metadata"]["nixl_memory_desc"]["ptr"] == POOL_BASE_PTR + d["byte_offset"]
+
+
+def test_resolve_hashes_force_offload_partial_success():
+    """When force_offload succeeds for some blocks but not others, only
+    the successful ones should have descriptors filled in."""
+    BLOCK_SIZE_BYTES = 4096
+    POOL_BASE_PTR = 0x3000_0000
+    WINDOW_SIZE = 4096
+
+    class FakeKv:
+        def find_and_pin_blocks_by_hash(
+            self, block_hashes, window_size, tier="host_pinned", stop_on_miss=True
+        ):
+            # Block 11 is already pinned in secondary; block 22 is primary-only.
+            results = []
+            for bh in block_hashes:
+                if int(bh) == 11:
+                    results.append({
+                        "block_hash": 11,
+                        "pinned": True,
+                        "found_tier": "host_pinned",
+                        "block_id": 42,
+                        "slot_idx": 5,
+                    })
+                else:
+                    results.append({
+                        "block_hash": int(bh),
+                        "pinned": False,
+                        "found_tier": "primary",
+                        "block_id": None,
+                        "slot_idx": None,
+                    })
+            return results
+
+        def force_offload_and_pin_blocks_by_hash(self, block_hashes, window_size):
+            # Force-offload succeeds for 22 but fails for 33 (no secondary space).
+            results = []
+            for bh in block_hashes:
+                if int(bh) == 22:
+                    results.append({
+                        "block_hash": 22,
+                        "pinned": True,
+                        "found_tier": "host_pinned",
+                        "block_id": 88,
+                        "slot_idx": 9,
+                    })
+                else:
+                    results.append({
+                        "block_hash": int(bh),
+                        "pinned": False,
+                        "found_tier": "primary",
+                        "block_id": None,
+                        "slot_idx": None,
+                    })
+            return results
+
+    kv = FakeKv()
+    hashes = [11, 22, 33]
+
+    # Step 1: Initial lookup.
+    raw_results = kv.find_and_pin_blocks_by_hash(hashes, WINDOW_SIZE)
+    descs = []
+    sibling_pins = {}
+    pinned_count = 0
+    primary_only_indices = []
+    for idx, raw in enumerate(raw_results):
+        if bool(raw.get("pinned", False)):
+            slot_idx = int(raw["slot_idx"])
+            byte_offset = slot_idx * BLOCK_SIZE_BYTES
+            descs.append({"block_hash": int(raw["block_hash"]), "byte_offset": byte_offset})
+            sibling_pins[int(raw["block_hash"])] = int(raw["block_id"])
+            pinned_count += 1
+        else:
+            descs.append(None)
+            if raw.get("found_tier") == "primary":
+                primary_only_indices.append(idx)
+
+    # Block 11 pinned, blocks 22 and 33 primary-only.
+    assert pinned_count == 1
+    assert primary_only_indices == [1, 2]
+
+    # Step 2: Force-offload retry.
+    force_hashes = [int(hashes[i]) for i in primary_only_indices]
+    force_results = kv.force_offload_and_pin_blocks_by_hash(force_hashes, WINDOW_SIZE)
+    for fi, fr in zip(primary_only_indices, force_results):
+        if bool(fr.get("pinned", False)):
+            slot_idx = int(fr["slot_idx"])
+            byte_offset = slot_idx * BLOCK_SIZE_BYTES
+            descs[fi] = {"block_hash": int(fr["block_hash"]), "byte_offset": byte_offset}
+            sibling_pins[int(fr["block_hash"])] = int(fr["block_id"])
+            pinned_count += 1
+
+    # Block 22 was force-offloaded; block 33 failed — desc stays None.
+    assert pinned_count == 2
+    assert descs[0] is not None  # block 11 (was already secondary)
+    assert descs[1] is not None  # block 22 (force-offloaded)
+    assert descs[2] is None      # block 33 (force-offload failed)
+    assert descs[0]["byte_offset"] == 5 * BLOCK_SIZE_BYTES
+    assert descs[1]["byte_offset"] == 9 * BLOCK_SIZE_BYTES
+    assert sibling_pins == {11: 42, 22: 88}
+
+
 def test_remote_g2_terminal_cleanup_releases_lease_once_for_all_reasons():
     released = []
     store = TargetRemoteG2BindingStore(
