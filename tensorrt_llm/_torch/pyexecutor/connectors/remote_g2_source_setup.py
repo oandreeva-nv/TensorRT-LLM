@@ -1554,6 +1554,15 @@ def maybe_start_remote_g2_service(
             global _GLOBAL_NIXL_SOURCE_BUNDLE
             _GLOBAL_NIXL_SOURCE_BUNDLE = bundle
             logging.warning(
+                "PROBE remote_g2_source_nixl: agent_name=%s pool_base_ptr=0x%x "
+                "pool_size=%d agent_desc_bytes=%d source_generation=%d",
+                bundle.remote_name,
+                bundle.pool_base_ptr,
+                bundle.pool_size_bytes,
+                len(bundle.agent_desc),
+                bundle.source_generation,
+            )
+            logging.warning(
                 "remote_g2: source NIXL agent built: agent_name=%s "
                 "pool_base_ptr=0x%x pool_size=%d tp_rank=%d",
                 bundle.remote_name,

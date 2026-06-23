@@ -170,6 +170,13 @@ def _empty_result(reason: str) -> RemoteG2ResolveResult:
 
 def _make_resolve_callable(wrapper: _TargetReqWrapper):
     def _resolve(plan: RemoteKvReusePlan) -> RemoteG2ResolveResult:
+        logging.warning(
+            "PROBE rpc_chain target_resolve_callable pid=%d plan_id=%s "
+            "source_worker_id=%s",
+            os.getpid(),
+            plan.plan_id,
+            plan.source_worker_id,
+        )
         try:
             response = wrapper.request(
                 "resolve",
@@ -328,6 +335,32 @@ def _make_target_descriptor_resolver(
                     name=f"remote-g2-target-block-{block.target_block_id}",
                 )
             )
+        # PROBE: emit the first/last target descriptor + source counterpart
+        # so we can verify they reference valid registered ranges on each side
+        if descs:
+            head_src = record.bound_blocks[0].source_descriptor
+            head_tgt = descs[0]
+            tail_tgt = descs[-1]
+            logging.warning(
+                "PROBE rpc_chain target_resolver request_id=%s n_blocks=%d "
+                "tgt_dev_id=%d block_size=%d "
+                "src_head ptr=0x%x len=%d pool=%s "
+                "tgt_head ptr=0x%x size=%d "
+                "tgt_tail ptr=0x%x size=%d",
+                record.request_id,
+                len(descs),
+                int(device_id),
+                int(block_size_bytes),
+                int(head_src.metadata.get("nixl_memory_desc", {}).get("ptr", 0))
+                  if isinstance(head_src.metadata.get("nixl_memory_desc"), dict)
+                  else 0,
+                int(head_src.byte_length),
+                str(head_src.pool_id),
+                head_tgt.ptr,
+                head_tgt.size,
+                tail_tgt.ptr,
+                tail_tgt.size,
+            )
         return descs
 
     return _resolve
@@ -358,6 +391,10 @@ def _build_listening_nixl_agent(name: str):
     agent = BindingsNixlTransferAgent.__new__(BindingsNixlTransferAgent)
     agent._cpp_agent = CppNixlTransferAgent(config)
     agent.name = name
+    logging.warning(
+        "PROBE remote_g2_target_listening_agent: name=%s connection_info=%s",
+        name, agent.get_local_connection_info(),
+    )
     return agent
 
 
@@ -451,6 +488,12 @@ class _ConnectionInfoNixlAdapter:
         connection_info = getattr(source_metadata, "connection_info", "") or ""
         key = (source_metadata.remote_name, int(source_metadata.source_generation))
         if connection_info and key not in self._loaded_remote_agents:
+            logging.warning(
+                "PROBE rpc_chain target_load_remote_by_connection name=%s connection_info=%s "
+                "(peer_handshake target=%s -> source=%s)",
+                source_metadata.remote_name, connection_info,
+                self._inner._local_peer_name, source_metadata.remote_name,
+            )
             agent.load_remote_agent_by_connection(
                 source_metadata.remote_name, connection_info
             )
@@ -477,6 +520,10 @@ class _ConnectionInfoNixlAdapter:
             source_metadata.remote_name,
         )
         status = agent.submit_transfer_requests(request)
+        logging.warning(
+            "PROBE rpc_chain nixl_read_submitted request_id=%s blocks=%d",
+            record.request_id, len(source_descs),
+        )
         return RemoteG2TransferResult(
             record=record,
             source_metadata=source_metadata,
@@ -673,6 +720,14 @@ def _build_target_nixl_adapter(
         logging.exception("remote_g2: RawNixlRemoteG2Adapter construction failed")
         return None
 
+    logging.warning(
+        "PROBE remote_g2_target_adapter: agent_name=%s primary_pool_base=0x%x "
+        "block_size_bytes=%d device_id=%d",
+        agent_name,
+        primary_base_ptr,
+        block_size_bytes,
+        device_id,
+    )
     return adapter
 
 
@@ -847,10 +902,20 @@ def maybe_start_remote_g2_target_client(
         return True
 
     def _noop_mark_local_valid(record: RemoteG2BindingRecord) -> None:
-        pass
+        logging.info(
+            "PROBE remote_g2_mark_local_valid (no-op): request_id=%s lease_id=%s blocks=%d",
+            record.request_id,
+            record.lease_id,
+            len(record.bound_blocks),
+        )
 
     def _noop_publish_binding(record: RemoteG2BindingRecord) -> None:
-        pass
+        logging.info(
+            "PROBE remote_g2_publish_binding (no-op): request_id=%s lease_id=%s blocks=%d",
+            record.request_id,
+            record.lease_id,
+            len(record.bound_blocks),
+        )
 
     remote_g2_connector.install_transfer_adapter(adapter)
     remote_g2_connector.install_mark_local_valid(_noop_mark_local_valid)
