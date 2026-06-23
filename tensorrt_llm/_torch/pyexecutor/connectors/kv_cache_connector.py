@@ -103,6 +103,7 @@ class KvCacheConnectorWorker(ABC):
     requires_disable_overlap_scheduler = False
     requires_disable_attention_dp = False
     requires_uniform_attention_window = False
+    supports_host_kv_cache = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -206,6 +207,7 @@ class KvCacheConnectorScheduler(ABC):
     requires_disable_overlap_scheduler = False
     requires_disable_attention_dp = False
     requires_uniform_attention_window = False
+    supports_host_kv_cache = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -469,6 +471,16 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             if connector is not None
         )
 
+    def _connector_supports(self, attr: str) -> bool:
+        connectors = [
+            connector
+            for connector in (self.worker, self.scheduler)
+            if connector is not None
+        ]
+        return bool(connectors) and all(
+            bool(getattr(connector, attr, False)) for connector in connectors
+        )
+
     @property
     def requires_retryable_kv_admission(self) -> bool:
         return self._connector_requires("requires_retryable_kv_admission")
@@ -484,6 +496,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     @property
     def requires_uniform_attention_window(self) -> bool:
         return self._connector_requires("requires_uniform_attention_window")
+
+    @property
+    def supports_host_kv_cache(self) -> bool:
+        return self._connector_supports("supports_host_kv_cache")
 
     def _run_on_leader(self, f: Callable[[], Any]) -> Any:
         """

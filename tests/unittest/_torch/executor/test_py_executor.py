@@ -619,6 +619,9 @@ def _make_executor_for_kv_connector_init():
     executor.kv_connector_manager.requires_disable_overlap_scheduler = False
     executor.kv_connector_manager.requires_disable_attention_dp = False
     executor.kv_connector_manager.requires_uniform_attention_window = False
+    executor.kv_connector_manager.supports_host_kv_cache = False
+    executor.model_engine = Mock()
+    executor.model_engine.model.named_modules.return_value = []
     return executor
 
 
@@ -630,6 +633,26 @@ def test_kv_connector_manager_rejects_attention_dp_when_required():
     with pytest.raises(NotImplementedError,
                        match="attention data parallelism|enable_attention_dp=False"):
         PyExecutor._maybe_init_kv_connector_manager(executor)
+
+
+def test_kv_connector_manager_rejects_host_kv_cache_by_default():
+    executor = _make_executor_for_kv_connector_init()
+    executor.llm_args.kv_cache_config = Mock(host_cache_size=1024)
+
+    with pytest.raises(NotImplementedError, match="host offloading"):
+        PyExecutor._maybe_init_kv_connector_manager(executor)
+
+
+def test_kv_connector_manager_allows_host_kv_cache_when_supported():
+    executor = _make_executor_for_kv_connector_init()
+    executor.llm_args.kv_cache_config = Mock(host_cache_size=1024)
+    executor.kv_connector_manager.supports_host_kv_cache = True
+
+    PyExecutor._maybe_init_kv_connector_manager(executor)
+
+    executor.kv_cache_manager.get_unique_primary_pool.assert_called_once()
+    executor.kv_connector_manager.worker.register_kv_caches.assert_called_once()
+    executor.kv_connector_manager.wait_for_initialization.assert_called_once()
 
 
 @pytest.mark.parametrize("is_vswa,is_linear_attention", [(True, False),

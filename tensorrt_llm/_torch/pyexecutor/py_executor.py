@@ -737,7 +737,8 @@ class PyExecutor:
                     "distinguished from real requests.")
 
             kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
-            if kv_cache_config is not None and kv_cache_config.host_cache_size:
+            if (kv_cache_config is not None and kv_cache_config.host_cache_size
+                    and not self.kv_connector_manager.supports_host_kv_cache):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with KV cache host "
                     "offloading (KvCacheConfig.host_cache_size). The connector "
