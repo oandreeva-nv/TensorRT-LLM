@@ -112,6 +112,34 @@ def _result_from_dict(data: dict) -> Optional[RemoteG2ResolveResult]:
             )
             for s in (data.get("per_block_status") or ())
         )
+        # T1/T2: Extract per-rank data if present (TP>1).
+        per_rank_descriptors: dict = {}
+        per_rank_source_metadata: dict = {}
+        raw_prd = data.get("per_rank_descriptors")
+        if isinstance(raw_prd, dict):
+            for rank_key, desc_list in raw_prd.items():
+                rank = int(rank_key)
+                per_rank_descriptors[rank] = desc_list  # raw dicts
+        raw_prm = data.get("per_rank_source_metadata")
+        if isinstance(raw_prm, (dict, list)):
+            import base64 as _b64_prm
+            if isinstance(raw_prm, list):
+                # List indexed by rank.
+                for i, meta in enumerate(raw_prm):
+                    per_rank_source_metadata[i] = meta
+            else:
+                for rank_key, meta in raw_prm.items():
+                    per_rank_source_metadata[int(rank_key)] = meta
+            # Decode agent_metadata_b64 → agent_metadata (raw bytes)
+            # so _ensure_peer_loaded can pass it to add_remote_agent.
+            for rank, meta in per_rank_source_metadata.items():
+                if isinstance(meta, dict) and "agent_metadata_b64" in meta:
+                    meta = dict(meta)  # don't mutate the original
+                    meta["agent_metadata"] = _b64_prm.b64decode(
+                        meta["agent_metadata_b64"]
+                    )
+                    per_rank_source_metadata[rank] = meta
+
         return RemoteG2ResolveResult(
             lease_id=data.get("lease_id"),
             descriptors=descriptors,
@@ -119,6 +147,8 @@ def _result_from_dict(data: dict) -> Optional[RemoteG2ResolveResult]:
             reason=str(data.get("reason", "ok")),
             source_generation=int(data.get("source_generation", 0)),
             per_block_status=per_block_status,
+            per_rank_descriptors=per_rank_descriptors,
+            per_rank_source_metadata=per_rank_source_metadata,
         )
     except (KeyError, TypeError, ValueError):
         logging.exception("remote_g2: malformed resolve response dict: %r", data)
@@ -260,12 +290,13 @@ def _make_source_metadata_fetcher(wrapper: _TargetReqWrapper, peer_info_provider
             remote_name=str(inner["remote_name"]),
             agent_desc=agent_desc,
         )
-        # Stash the connection_info on the dataclass instance for our
-        # subclassed adapter to pick up. The official dataclass is frozen,
-        # but Python lets us attach attrs via object.__setattr__ since
-        # we own the consumer side. Cleaner than threading an extra
-        # arg through the existing source_metadata_fetcher signature.
+        # Stash extra fields on the dataclass instance for downstream use.
         object.__setattr__(meta, "connection_info", connection_info)
+        # T4: Stash per-rank metadata (S5 response) so the adapter can
+        # index by mpi_rank() at transfer time.
+        per_rank_metadata = inner.get("per_rank_metadata")
+        if per_rank_metadata is not None:
+            object.__setattr__(meta, "per_rank_metadata", per_rank_metadata)
         return meta
 
     return _fetch
@@ -713,11 +744,19 @@ def _wait_for_socket(path: str, timeout_s: float = 30.0) -> bool:
     return False
 
 
-def maybe_start_remote_g2_target_client(kv: Optional[Any] = None) -> bool:
+def maybe_start_remote_g2_target_client(
+    kv: Optional[Any] = None,
+    *,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+) -> bool:
     """Open the engine→parent ZMQ REQ socket and install module-state
     callables on remote_g2_connector. Returns True on success, False
     when not configured (no dynamo parent reachable) or when the
     parent's REP socket never appears.
+
+    TP>1: tp_rank and tp_size are passed through so the target adapter
+    knows which rank's source metadata to use for NIXL peer loads.
 
     When ``kv`` (the C++ kv_cache_manager) is provided, also constructs
     the NIXL transfer adapter and installs it + no-op mark_local_valid /
@@ -771,22 +810,66 @@ def maybe_start_remote_g2_target_client(kv: Optional[Any] = None) -> bool:
     remote_g2_connector.install_release_lease(release_fn)
 
     # Install the block_id → primary-pool slot_idx lookup the binding
-    # store uses to build NIXL local-dlist indices. Uses the non-pinning
-    # C++ accessor get_slot_idx_by_block_id, which composes
-    # getBlockById(id, window) -> getMemoryPoolBlockIndex() under one
-    # call — no refcount bump, no race window.
-    window_size = _derive_window_size(kv)
+    # store uses to build NIXL local-dlist indices.
+    # Unwrap .impl to get the C++ KvCacheManager binding — the Python
+    # wrapper may not expose pin_blocks_by_id / get_slot_idx_by_block_id.
+    _kv_impl = getattr(kv, "impl", kv)
+    window_size = _derive_window_size(_kv_impl)
+
+    # Detect whether the non-pinning accessor exists (added after rc15).
+    _has_get_slot = hasattr(_kv_impl, "get_slot_idx_by_block_id")
+    _has_pin_unpin = hasattr(_kv_impl, "pin_blocks_by_id") and hasattr(
+        _kv_impl, "unpin_blocks_by_id"
+    )
+    logging.warning(
+        "remote_g2: block_id_to_slot_idx setup: "
+        "has_get_slot=%s has_pin_unpin=%s window_size=%s kv_type=%s",
+        _has_get_slot,
+        _has_pin_unpin,
+        window_size,
+        type(_kv_impl).__name__,
+    )
 
     def _block_id_to_slot_idx(block_ids: list[int]) -> list[int]:
         if not block_ids or window_size is None:
             return []
-        try:
-            return [
-                int(kv.get_slot_idx_by_block_id(int(b), int(window_size)))
-                for b in block_ids
-            ]
-        except Exception:
-            return []
+        int_ids = [int(b) for b in block_ids]
+
+        # Preferred: non-pinning single-call accessor (post-rc15).
+        if _has_get_slot:
+            try:
+                return [
+                    int(_kv_impl.get_slot_idx_by_block_id(b, int(window_size)))
+                    for b in int_ids
+                ]
+            except Exception as exc:
+                logging.warning(
+                    "remote_g2: get_slot_idx_by_block_id failed: %s", exc
+                )
+                return []
+
+        # Fallback: pin_blocks_by_id returns [(pool_type, slot_idx), ...].
+        # We immediately unpin so refcounts stay balanced.
+        if _has_pin_unpin:
+            try:
+                pairs = _kv_impl.pin_blocks_by_id(int_ids)
+                # Immediately unpin — we only need the slot indices.
+                _kv_impl.unpin_blocks_by_id(int_ids)
+                return [int(p[1]) for p in pairs]
+            except Exception as exc:
+                logging.warning(
+                    "remote_g2: pin_blocks_by_id fallback failed: %s", exc
+                )
+                try:
+                    _kv_impl.unpin_blocks_by_id(int_ids)
+                except Exception:
+                    pass
+                return []
+
+        logging.warning(
+            "remote_g2: no block_id→slot_idx method available"
+        )
+        return []
 
     remote_g2_connector.install_block_id_to_slot_idx(_block_id_to_slot_idx)
 

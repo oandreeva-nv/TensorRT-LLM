@@ -1275,6 +1275,21 @@ public:
     [[nodiscard]] std::vector<CacheLookupResult> findAndPinBlocksByHash(
         std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss);
 
+    //! \brief Force-offload blocks from primary to secondary by hash, then pin.
+    //!
+    //! For each hash, finds the block in the radix tree. If the block is in primary,
+    //! offloads it to secondary (host-pinned) memory. If already in secondary, simply
+    //! pins it. Returns CacheLookupResult with the post-offload secondary slot info.
+    //!
+    //! This is used by TP>1 KV-P2P to ensure all ranks have blocks in the secondary
+    //! tier for NIXL transfers, even when the opportunistic offload in getFreeBlock
+    //! has not yet occurred on this rank.
+    //!
+    //! Stops on the first hash that cannot be found or offloaded. Pinned blocks must
+    //! be released by the caller via unpinBlocksById.
+    [[nodiscard]] std::vector<CacheLookupResult> forceOffloadAndPinBlocksByHash(
+        std::vector<size_t> const& blockHashes);
+
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
@@ -1918,6 +1933,17 @@ public:
         return it->second.findAndPinBlocksByHash(blockHashes, requestedTier, stopOnMiss);
     }
 
+    [[nodiscard]] std::vector<CacheLookupResult> forceOffloadAndPinBlocksByHash(
+        std::vector<size_t> const& blockHashes, SizeType32 windowSize)
+    {
+        auto it = mWindowBlockManagers.find(windowSize);
+        if (it == mWindowBlockManagers.end())
+        {
+            return {};
+        }
+        return it->second.forceOffloadAndPinBlocksByHash(blockHashes);
+    }
+
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumPrimaryBlocks(); });
@@ -2305,6 +2331,10 @@ public:
 
     [[nodiscard]] virtual std::vector<CacheLookupResult> findAndPinBlocksByHash(
         std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss, SizeType32 windowSize)
+        = 0;
+
+    [[nodiscard]] virtual std::vector<CacheLookupResult> forceOffloadAndPinBlocksByHash(
+        std::vector<size_t> const& blockHashes, SizeType32 windowSize)
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
@@ -2748,6 +2778,12 @@ public:
         override
     {
         return mBlockManager.findAndPinBlocksByHash(blockHashes, requestedTier, stopOnMiss, windowSize);
+    }
+
+    std::vector<CacheLookupResult> forceOffloadAndPinBlocksByHash(
+        std::vector<size_t> const& blockHashes, SizeType32 windowSize) override
+    {
+        return mBlockManager.forceOffloadAndPinBlocksByHash(blockHashes, windowSize);
     }
 
     void resetReuseState() override

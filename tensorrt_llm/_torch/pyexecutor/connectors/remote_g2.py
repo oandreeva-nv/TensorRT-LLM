@@ -367,6 +367,14 @@ class RemoteG2ResolveResult:
     reason: str = "ok"
     source_generation: int = 0
     per_block_status: tuple[RemoteG2BlockStatus, ...] = ()
+    # T1: Per-rank descriptors for TP>1. Keyed by tp_rank (int).
+    # Each value is a tuple of descriptors for that rank's KV slice.
+    # TP=1 callers can ignore this (empty dict).
+    per_rank_descriptors: dict = field(default_factory=dict)
+    # T2: Per-rank source metadata for TP>1. Keyed by tp_rank (int).
+    # Each value is a dict with keys: remote_name, agent_metadata_b64,
+    # pool_base_ptr, pool_size_bytes, source_generation.
+    per_rank_source_metadata: dict = field(default_factory=dict)
 
 
 class RemoteG2BindingState(str, Enum):

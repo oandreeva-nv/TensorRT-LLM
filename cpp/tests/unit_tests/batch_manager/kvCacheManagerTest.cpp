@@ -5252,6 +5252,150 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchSkipsPinnedSecondaryBlock)
     (void) kvCacheManager.removeSequence(2, retryRequest);
 }
 
+// Verifies that forceOffloadAndPinBlocksByHash can move primary-only blocks to
+// secondary and pin them in a single call. This is the core mechanism that ensures
+// symmetric secondary-tier availability across TP ranks for NIXL RDMA transfers.
+// Two independent KVCacheManagers simulate TP rank 0 and rank 1. Rank 0 receives
+// memory pressure that naturally offloads blocks; rank 1 does not. The test then
+// calls forceOffloadAndPinBlocksByHash on rank 1 to verify blocks are force-offloaded
+// on demand, matching rank 0's secondary availability.
+TEST_F(KVCacheManagerTest, ForceOffloadAndPinBlocksByHashMovesToSecondary)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 4;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+
+    // Create two KVCacheManagers to simulate two TP ranks.
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    auto makeManager = [&]()
+    {
+        auto mgr = std::make_unique<KVCacheManager>(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
+            maxNumSequences, beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
+            nvinfer1::DataType::kHALF, 0, stream, maxAttentionWindow, maxAttentionWindow, true);
+        mgr->allocatePools(false);
+        return mgr;
+    };
+    auto rank0 = makeManager();
+    auto rank1 = makeManager();
+
+    // Feed both ranks the same input tokens to get identical block hashes.
+    auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
+    tr::SamplingConfig const samplingConfig2{beamWidth};
+    bool constexpr isStreaming2{false};
+
+    LlmRequest::RequestIdType reqId0{0};
+    auto req0 = std::make_shared<LlmRequest>(reqId0, 0, inputTokens2, samplingConfig2, isStreaming2);
+    rank0->addSequenceBatch({{{reqId0, static_cast<SizeType32>(inputTokens2->size()), beamWidth}}}, {std::ref(*req0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req0);
+    rank0->storeContextBlocks(*req0);
+
+    LlmRequest::RequestIdType reqId1{0};
+    auto req1 = std::make_shared<LlmRequest>(reqId1, 0, inputTokens2, samplingConfig2, isStreaming2);
+    rank1->addSequenceBatch({{{reqId1, static_cast<SizeType32>(inputTokens2->size()), beamWidth}}}, {std::ref(*req1)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req1);
+    rank1->storeContextBlocks(*req1);
+
+    // Collect block hashes from rank 1's stored blocks.
+    auto const rank1BlockIds = rank1->getCacheBlockIds(reqId1, maxAttentionWindow)[0];
+    auto& rank1BlockMgr = rank1->getBlockManager();
+    std::vector<size_t> storedHashes;
+    for (auto bid : rank1BlockIds)
+    {
+        auto block = rank1BlockMgr.getBlockById(bid, maxAttentionWindow);
+        if (block && block->getLookupNode() != nullptr)
+        {
+            storedHashes.push_back(block->getHash());
+        }
+    }
+    ASSERT_FALSE(storedHashes.empty()) << "need at least one stored block with a hash";
+
+    // Release both sequences so blocks become zero-ref reuse candidates.
+    (void) rank0->removeSequence(reqId0, req0);
+    (void) rank1->removeSequence(reqId1, req1);
+
+    // Apply memory pressure to rank 0 ONLY — this naturally offloads blocks to
+    // secondary. Rank 1 gets no pressure, simulating the TP asymmetry we see
+    // in production (rank 0 processes extra resolve_and_lease queries that
+    // perturb its free queue).
+    {
+        LlmRequest::RequestIdType pressureId{1};
+        auto pressureTokens2 = std::make_shared<VecTokens>(
+            VecTokens{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25});
+        auto pressureReq = std::make_shared<LlmRequest>(pressureId, 0, pressureTokens2, samplingConfig2, isStreaming2);
+        rank0->addSequenceBatch(
+            {{{pressureId, static_cast<SizeType32>(pressureTokens2->size()), beamWidth}}}, {std::ref(*pressureReq)});
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*pressureReq);
+        rank0->storeContextBlocks(*pressureReq);
+    }
+
+    // Verify asymmetry: rank 0 should have some blocks in secondary, rank 1 should not.
+    size_t rank0SecondaryCount = 0;
+    size_t rank1PrimaryOnlyCount = 0;
+    for (auto blockHash : storedHashes)
+    {
+        auto r0 = rank0->findAndPinBlocksByHash({blockHash}, CachePoolTier::kHostPinned, true, maxAttentionWindow);
+        if (!r0.empty() && r0[0].pinned)
+        {
+            rank0SecondaryCount++;
+            rank0->unpinBlocksById({r0[0].blockId});
+        }
+        auto r1 = rank1->findAndPinBlocksByHash({blockHash}, CachePoolTier::kHostPinned, true, maxAttentionWindow);
+        if (!r1.empty() && !r1[0].pinned && r1[0].foundTier.has_value()
+            && *r1[0].foundTier == CachePoolTier::kPrimary)
+        {
+            rank1PrimaryOnlyCount++;
+        }
+    }
+    ASSERT_GT(rank0SecondaryCount, 0u) << "pressure workload did not offload any blocks on rank 0";
+    ASSERT_GT(rank1PrimaryOnlyCount, 0u) << "rank 1 should still have blocks in primary only";
+
+    // Now call forceOffloadAndPinBlocksByHash on rank 1.
+    auto forceResults = rank1->forceOffloadAndPinBlocksByHash(storedHashes, maxAttentionWindow);
+
+    // Verify all blocks were force-offloaded and pinned in secondary.
+    std::vector<KVCacheBlock::IdType> pinnedIds;
+    size_t forceOffloadedCount = 0;
+    for (auto const& result : forceResults)
+    {
+        ASSERT_TRUE(result.pinned)
+            << "block hash " << result.blockHash << " should have been force-offloaded and pinned";
+        ASSERT_TRUE(result.foundTier.has_value());
+        EXPECT_EQ(*result.foundTier, CachePoolTier::kHostPinned);
+        EXPECT_GE(result.slotIdx, 0);
+        pinnedIds.push_back(result.blockId);
+        forceOffloadedCount++;
+    }
+    EXPECT_EQ(forceOffloadedCount, storedHashes.size());
+
+    // Verify the blocks are now actually in secondary on rank 1 via the regular
+    // findAndPinBlocksByHash path.
+    rank1->unpinBlocksById(pinnedIds);
+    for (auto blockHash : storedHashes)
+    {
+        auto verify
+            = rank1->findAndPinBlocksByHash({blockHash}, CachePoolTier::kHostPinned, true, maxAttentionWindow);
+        ASSERT_EQ(verify.size(), 1);
+        EXPECT_TRUE(verify[0].pinned) << "block should now be findable in secondary after force-offload";
+        if (verify[0].pinned)
+        {
+            rank1->unpinBlocksById({verify[0].blockId});
+        }
+    }
+
+    // Unknown hash returns a miss.
+    auto missing = rank1->forceOffloadAndPinBlocksByHash({0xdeadbeefdeadbeefULL}, maxAttentionWindow);
+    ASSERT_EQ(missing.size(), 1);
+    EXPECT_FALSE(missing[0].pinned);
+}
+
 // Regression test for NVBug 6018647: storeBlocks(pin=true) on a zero-ref block
 // that sits in the eviction free queue must call claimBlock() before incRefCount().
 // Without the fix, unpinBlocksById inserts the block into the free queue a second

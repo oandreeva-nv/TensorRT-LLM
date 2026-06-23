@@ -103,6 +103,7 @@ class KvCacheConnectorWorker(ABC):
     requires_disable_overlap_scheduler = False
     requires_disable_attention_dp = False
     requires_uniform_attention_window = False
+    supports_host_kv_cache = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -206,6 +207,7 @@ class KvCacheConnectorScheduler(ABC):
     requires_disable_overlap_scheduler = False
     requires_disable_attention_dp = False
     requires_uniform_attention_window = False
+    supports_host_kv_cache = False
 
     def __init__(self, llm_args: TorchLlmArgs):
         self._llm_args = llm_args
@@ -469,6 +471,16 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             if connector is not None
         )
 
+    def _connector_supports(self, attr: str) -> bool:
+        connectors = [
+            connector
+            for connector in (self.worker, self.scheduler)
+            if connector is not None
+        ]
+        return bool(connectors) and all(
+            bool(getattr(connector, attr, False)) for connector in connectors
+        )
+
     @property
     def requires_retryable_kv_admission(self) -> bool:
         return self._connector_requires("requires_retryable_kv_admission")
@@ -484,6 +496,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     @property
     def requires_uniform_attention_window(self) -> bool:
         return self._connector_requires("requires_uniform_attention_window")
+
+    @property
+    def supports_host_kv_cache(self) -> bool:
+        return self._connector_supports("supports_host_kv_cache")
 
     def _run_on_leader(self, f: Callable[[], Any]) -> Any:
         """
@@ -638,6 +654,19 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # Find only the requests that have been reported complete by all workers.
         intersect_finished_saving = set.intersection(*[set(res[0]) for res in all_results])
         intersect_finished_loading = set.intersection(*[set(res[1]) for res in all_results])
+
+        # Fix 1 (TP>1 release lifecycle): notify the worker that these
+        # loading requests are globally confirmed — all TP ranks have
+        # finished their transfers.  The remote-G2 worker uses this
+        # hook to send the deferred release_lease RPC to the source,
+        # which is only safe once ALL target ranks are done reading.
+        # Duck-typed: only remote-G2 workers implement this method.
+        if intersect_finished_loading and hasattr(
+            self.worker, "on_globally_finished_loading"
+        ):
+            self.worker.on_globally_finished_loading(
+                intersect_finished_loading
+            )
 
         # Remove these requests from our list of locally finished requests.
         all_finished = self.local_finished_async_requests.extract_by_id(
