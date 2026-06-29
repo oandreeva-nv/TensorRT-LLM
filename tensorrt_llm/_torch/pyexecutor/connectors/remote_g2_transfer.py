@@ -34,7 +34,7 @@ def validate_remote_g2_transfer_result(result: Any) -> Any:
     missing = []
     if not isinstance(getattr(result, "initial_state", None), RemoteG2TransferState):
         missing.append("initial_state")
-    for method_name in ("poll_state", "quiesce"):
+    for method_name in ("poll_state", "release_transfer"):
         if not callable(getattr(result, method_name, None)):
             missing.append(method_name)
     if missing:
@@ -171,7 +171,7 @@ class RemoteG2SourceMetadataCache:
 
 
 class RemoteG2NixlTransferAdapter:
-    supports_synchronous_release = False
+    supports_retryable_release = False
 
     def __init__(
         self,

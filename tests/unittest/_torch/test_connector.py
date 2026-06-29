@@ -25,23 +25,16 @@ import pytest
 from tensorrt_llm import mpi_rank
 from tensorrt_llm._torch.pyexecutor.connectors import kv_cache_connector
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    AsyncRequests,
-    KvCacheConnectorManager,
-    KvCacheConnectorPollResult,
-    KvCacheConnectorScheduler,
-    KvCacheConnectorSchedulerOutputManager,
-    KvCacheConnectorWorker,
-)
+    AsyncRequests, KvCacheConnectorManager, KvCacheConnectorPollResult,
+    KvCacheConnectorScheduler, KvCacheConnectorSchedulerOutputManager,
+    KvCacheConnectorWorker)
 from tensorrt_llm._torch.pyexecutor.connectors.remote_g2 import (
-    RemoteG2BindingState,
-    TargetRemoteG2BindingStore,
-)
+    RemoteG2BindingState, TargetRemoteG2BindingStore)
 from tensorrt_llm._torch.pyexecutor.connectors.remote_g2_connector import (
-    RemoteG2ConnectorMetadata,
-    RemoteG2KvCacheConnectorScheduler,
-    RemoteG2KvCacheConnectorWorker,
-)
-from tensorrt_llm._torch.pyexecutor.connectors.remote_g2_transfer import RemoteG2TransferState
+    RemoteG2ConnectorMetadata, RemoteG2KvCacheConnectorScheduler,
+    RemoteG2KvCacheConnectorWorker)
+from tensorrt_llm._torch.pyexecutor.connectors.remote_g2_transfer import \
+    RemoteG2TransferState
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
@@ -80,25 +73,29 @@ class _RankZeroReleaseStore:
 
 class _RemoteG2MpiResult:
 
-    def __init__(self, record, initial_state, poll_states=(), quiesce=(True, )):
+    def __init__(self,
+                 record,
+                 initial_state,
+                 poll_states=(),
+                 release_transfer=(True, )):
         self.record = record
         self.initial_state = initial_state
         self.poll_states = list(poll_states)
-        self.quiesce_outcomes = list(quiesce)
+        self.release_transfer_outcomes = list(release_transfer)
 
     def poll_state(self):
         if self.poll_states:
             return self.poll_states.pop(0)
         return self.initial_state
 
-    def quiesce(self):
-        if self.quiesce_outcomes:
-            return self.quiesce_outcomes.pop(0)
+    def release_transfer(self):
+        if self.release_transfer_outcomes:
+            return self.release_transfer_outcomes.pop(0)
         return True
 
 
 class _RemoteG2MpiAdapter:
-    supports_synchronous_release = True
+    supports_retryable_release = True
 
     def __init__(self, result):
         self.result = result
@@ -130,12 +127,13 @@ def _remote_g2_mpi_record():
 def test_connector_failure_abort_defaults_are_backward_compatible():
     worker = MagicMock(spec=KvCacheConnectorWorker)
     assert KvCacheConnectorWorker.take_failed_load_request_ids(worker) == set()
-    assert KvCacheConnectorWorker.abort_request(worker, 42) is True
+    assert KvCacheConnectorWorker.try_abort_request(worker, 42) is True
 
     scheduler = MagicMock(spec=KvCacheConnectorScheduler)
-    assert KvCacheConnectorScheduler.abort_request(scheduler, 42,
-                                                   "cancelled") is True
-    assert KvCacheConnectorScheduler.finish_load(scheduler, 42) is True
+    assert KvCacheConnectorScheduler.try_abort_request(scheduler, 42,
+                                                       "cancelled") is True
+    assert KvCacheConnectorScheduler.finalize_successful_load(scheduler,
+                                                              42) is True
 
 
 def test_async_requests_discard_request_id_is_idempotent():
@@ -228,12 +226,12 @@ def test_connector_manager_get_finished_allgather(mpi_pool_executor):
             worker.get_finished.return_value = ([42], [])
 
         assert manager.get_finished() == KvCacheConnectorPollResult(
-            finished_saving=[req])
+            finished_save_requests=[req])
 
     run_across_mpi(mpi_pool_executor, test, 2)
 
 
-def test_connector_manager_request_abort_filters_untracked_and_reused_ids(
+def test_connector_manager_try_abort_request_filters_untracked_and_reused_ids(
         monkeypatch):
     monkeypatch.setattr(
         "tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector.mpi_rank",
@@ -242,19 +240,19 @@ def test_connector_manager_request_abort_filters_untracked_and_reused_ids(
     scheduler = MagicMock()
     manager = KvCacheConnectorManager(worker, scheduler)
 
-    assert manager.request_abort(42, "cancelled") is True
+    assert manager.try_abort_request(42, "cancelled") is True
 
     old_request = MagicMock(request_id=42)
     manager.new_async_requests.loading[42] = old_request
-    assert manager.request_abort(42, "cancelled") is False
-    assert manager._abort_requests[42] is old_request
+    assert manager.try_abort_request(42, "cancelled") is False
+    assert manager._request_coordination[42].request is old_request
 
-    manager._discard_request_data(42)
-    manager._finalize_request_id(42)
+    manager._discard_request_bookkeeping(42)
+    manager._finalize_aborted_request(42)
     new_request = MagicMock(request_id=42)
     manager.new_async_requests.loading[42] = new_request
-    assert manager.request_abort(42, "cancelled") is False
-    assert manager._abort_requests[42] is new_request
+    assert manager.try_abort_request(42, "cancelled") is False
+    assert manager._request_coordination[42].request is new_request
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
@@ -267,10 +265,10 @@ def test_connector_manager_failed_load_reaches_tp_consensus_and_drains_state(
         worker.get_finished.return_value = (([], [42]) if mpi_rank() == 0 else
                                             ([], []))
         worker.take_failed_load_request_ids.return_value = set()
-        worker.abort_request.return_value = True
+        worker.try_abort_request.return_value = True
         scheduler = MagicMock() if mpi_rank() == 0 else None
         if scheduler is not None:
-            scheduler.abort_request.return_value = True
+            scheduler.try_abort_request.return_value = True
         manager = KvCacheConnectorManager(worker, scheduler)
         request = MagicMock(request_id=42)
         request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -310,35 +308,29 @@ def test_connector_manager_failed_load_reaches_tp_consensus_and_drains_state(
         assert request.state != LlmRequestState.CONTEXT_INIT
 
         # Failure beats a peer completion and a simultaneous cancellation.
-        manager.request_abort(42, "cancelled")
+        manager.try_abort_request(42, "cancelled")
         worker.get_finished.return_value = ([], [])
         worker.take_failed_load_request_ids.return_value = set()
         assert manager.get_finished() == KvCacheConnectorPollResult()
-        worker.abort_request.assert_called_once_with(42)
+        worker.try_abort_request.assert_called_once_with(42)
         assert request.state != LlmRequestState.CONTEXT_INIT
         # Rank 1's local discard failed, but every rank preserves coordination
         # and the canonical request until the next collective retry succeeds.
-        assert manager._global_abort_intents[42] == "transfer_failed"
-        assert manager._abort_requests[42] is request
-        assert (42 in manager._local_data_cleaned) == (mpi_rank() == 0)
+        coordination = manager._request_coordination[42]
+        assert coordination.consensus_abort_reason == "transfer_failed"
+        assert coordination.request is request
+        assert coordination.local_bookkeeping_cleaned is (mpi_rank() == 0)
         assert request.state != LlmRequestState.CONTEXT_INIT
 
         assert manager.get_finished() == KvCacheConnectorPollResult(
-            failed_loading=[request])
+            failed_load_requests=[request])
         assert request.state != LlmRequestState.CONTEXT_INIT
-        assert manager.request_abort(42, "cancelled") is True
+        assert manager.try_abort_request(42, "cancelled") is True
         assert manager.new_async_requests.loading == {}
         assert manager.pending_async_requests.loading == {}
         assert manager.local_finished_async_requests.loading == {}
         assert manager.finished_async_loading_requests == {}
-        assert manager._abort_requests == {}
-        assert manager._local_abort_intents == {}
-        assert manager._global_abort_intents == {}
-        assert manager._local_quiescent == set()
-        assert manager._all_ranks_quiescent == set()
-        assert manager._local_data_cleaned == set()
-        assert manager._scheduler_cleanup_acks == set()
-        assert manager._scheduler_success_acks == set()
+        assert manager._request_coordination == {}
         assert 42 not in manager.scheduler_output_manager.requests
         assert 42 not in manager.scheduler_output_manager.external_loads
         discard_calls = (
@@ -348,13 +340,13 @@ def test_connector_manager_failed_load_reaches_tp_consensus_and_drains_state(
                 for call in discard_calls] == [(42, )] * expected_discard_calls
         assert manager._scheduler_output.new_requests == []
         assert manager._scheduler_output.cached_requests == [unrelated_output]
-        cleanup_calls = worker.abort_request.call_count
+        cleanup_calls = worker.try_abort_request.call_count
         assert manager.get_finished() == KvCacheConnectorPollResult()
-        assert worker.abort_request.call_count == cleanup_calls
+        assert worker.try_abort_request.call_count == cleanup_calls
         assert request.state != LlmRequestState.CONTEXT_INIT
         if scheduler is not None:
-            scheduler.finish_load.assert_not_called()
-            scheduler.abort_request.assert_called_once_with(
+            scheduler.finalize_successful_load.assert_not_called()
+            scheduler.try_abort_request.assert_called_once_with(
                 42, "transfer_failed")
 
     run_across_mpi(mpi_pool_executor, test, 2)
@@ -374,7 +366,7 @@ def test_connector_manager_success_waits_for_all_ranks_and_scheduler_ack(
                                             ([], []))
         scheduler = MagicMock() if mpi_rank() == 0 else None
         if scheduler is not None:
-            scheduler.finish_load.side_effect = finish_outcomes
+            scheduler.finalize_successful_load.side_effect = finish_outcomes
         manager = KvCacheConnectorManager(worker, scheduler)
         request = MagicMock(request_id=42)
         request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -383,7 +375,7 @@ def test_connector_manager_success_waits_for_all_ranks_and_scheduler_ack(
         assert manager.get_finished() == KvCacheConnectorPollResult()
         assert request.state != LlmRequestState.CONTEXT_INIT
         if scheduler is not None:
-            scheduler.finish_load.assert_not_called()
+            scheduler.finalize_successful_load.assert_not_called()
 
         worker.get_finished.return_value = (([], []) if mpi_rank() == 0 else
                                             ([], [42]))
@@ -392,7 +384,7 @@ def test_connector_manager_success_waits_for_all_ranks_and_scheduler_ack(
 
         worker.get_finished.return_value = ([], [])
         expected_calls = len(finish_outcomes)
-        while scheduler is not None and scheduler.finish_load.call_count < expected_calls:
+        while scheduler is not None and scheduler.finalize_successful_load.call_count < expected_calls:
             assert manager.get_finished() == KvCacheConnectorPollResult()
             assert request.state != LlmRequestState.CONTEXT_INIT
         # Non-leaders execute the same number of polls as rank 0.
@@ -403,7 +395,7 @@ def test_connector_manager_success_waits_for_all_ranks_and_scheduler_ack(
         assert manager.get_finished() == KvCacheConnectorPollResult()
         assert request.state == LlmRequestState.CONTEXT_INIT
         if scheduler is not None:
-            assert scheduler.finish_load.call_count == expected_calls
+            assert scheduler.finalize_successful_load.call_count == expected_calls
 
     run_across_mpi(mpi_pool_executor, test, 2)
 
@@ -417,11 +409,11 @@ def test_connector_manager_cancellation_after_success_callback_never_promotes(
         worker = MagicMock()
         worker.get_finished.return_value = ([], [42])
         worker.take_failed_load_request_ids.return_value = set()
-        worker.abort_request.return_value = True
+        worker.try_abort_request.return_value = True
         scheduler = MagicMock() if mpi_rank() == 0 else None
         if scheduler is not None:
-            scheduler.finish_load.return_value = True
-            scheduler.abort_request.return_value = True
+            scheduler.finalize_successful_load.return_value = True
+            scheduler.try_abort_request.return_value = True
         manager = KvCacheConnectorManager(worker, scheduler)
         request = MagicMock(request_id=42)
         request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -430,8 +422,8 @@ def test_connector_manager_cancellation_after_success_callback_never_promotes(
         assert manager.get_finished() == KvCacheConnectorPollResult()
         assert request.state != LlmRequestState.CONTEXT_INIT
         if scheduler is not None:
-            scheduler.finish_load.assert_called_once_with(42)
-            assert manager.request_abort(42, "cancelled") is False
+            scheduler.finalize_successful_load.assert_called_once_with(42)
+            assert manager.try_abort_request(42, "cancelled") is False
 
         worker.get_finished.return_value = ([], [])
         assert manager.get_finished() == KvCacheConnectorPollResult()
@@ -440,10 +432,10 @@ def test_connector_manager_cancellation_after_success_callback_never_promotes(
         assert request.state != LlmRequestState.CONTEXT_INIT
         assert manager.get_finished() == KvCacheConnectorPollResult()
         assert request.state != LlmRequestState.CONTEXT_INIT
-        assert manager.request_abort(42, "cancelled") is True
+        assert manager.try_abort_request(42, "cancelled") is True
         if scheduler is not None:
-            scheduler.finish_load.assert_called_once_with(42)
-            scheduler.abort_request.assert_called_once_with(42, "cancelled")
+            scheduler.finalize_successful_load.assert_called_once_with(42)
+            scheduler.try_abort_request.assert_called_once_with(42, "cancelled")
 
     run_across_mpi(mpi_pool_executor, test, 2)
 
@@ -458,10 +450,10 @@ def test_connector_manager_failure_waits_for_all_worker_releases(
         worker.get_finished.return_value = ([], [])
         worker.take_failed_load_request_ids.return_value = ({42} if mpi_rank()
                                                             == 1 else set())
-        worker.abort_request.return_value = True
+        worker.try_abort_request.return_value = True
         scheduler = MagicMock() if mpi_rank() == 0 else None
         if scheduler is not None:
-            scheduler.abort_request.return_value = True
+            scheduler.try_abort_request.return_value = True
         manager = KvCacheConnectorManager(worker, scheduler)
         request = MagicMock(request_id=42)
         request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -471,12 +463,12 @@ def test_connector_manager_failure_waits_for_all_worker_releases(
         worker.take_failed_load_request_ids.return_value = set()
         assert manager.get_finished() == KvCacheConnectorPollResult()
         if scheduler is not None:
-            scheduler.abort_request.assert_called_once_with(
+            scheduler.try_abort_request.assert_called_once_with(
                 42, "transfer_failed")
         assert manager.get_finished() == KvCacheConnectorPollResult(
-            failed_loading=[request])
+            failed_load_requests=[request])
         if scheduler is not None:
-            scheduler.abort_request.assert_called_once_with(
+            scheduler.try_abort_request.assert_called_once_with(
                 42, "transfer_failed")
 
     run_across_mpi(mpi_pool_executor, test, 2)
@@ -496,9 +488,7 @@ def test_remote_g2_tp_success_releases_once_after_all_ranks_finish(
         scheduler = None
         if mpi_rank() == 0:
             scheduler = RemoteG2KvCacheConnectorScheduler(
-                None,
-                binding_store=release_store,
-                plan_store=MagicMock())
+                None, binding_store=release_store, plan_store=MagicMock())
         manager = KvCacheConnectorManager(worker, scheduler)
         request = MagicMock(request_id=42)
         request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -533,14 +523,12 @@ def test_remote_g2_tp_failure_waits_for_peer_release_before_rank0_release(
         worker.get_finished.return_value = ([], [])
         worker.take_failed_load_request_ids.return_value = ({42} if mpi_rank()
                                                             == 1 else set())
-        worker.abort_request.return_value = True
+        worker.try_abort_request.return_value = True
         release_store = _RankZeroReleaseStore([True])
         scheduler = None
         if mpi_rank() == 0:
             scheduler = RemoteG2KvCacheConnectorScheduler(
-                None,
-                binding_store=release_store,
-                plan_store=MagicMock())
+                None, binding_store=release_store, plan_store=MagicMock())
         manager = KvCacheConnectorManager(worker, scheduler)
         request = MagicMock(request_id=42)
         request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -552,7 +540,7 @@ def test_remote_g2_tp_failure_waits_for_peer_release_before_rank0_release(
         if scheduler is not None:
             assert release_store.calls == [(42, "transfer_failed")]
         assert manager.get_finished() == KvCacheConnectorPollResult(
-            failed_loading=[request])
+            failed_load_requests=[request])
         if scheduler is not None:
             assert release_store.calls == [(42, "transfer_failed")]
 
@@ -569,15 +557,13 @@ def test_remote_g2_tp_rank0_release_exception_retries_before_finalization(
         worker.get_finished.return_value = ([], [])
         worker.take_failed_load_request_ids.return_value = ({42} if mpi_rank()
                                                             == 1 else set())
-        worker.abort_request.return_value = True
+        worker.try_abort_request.return_value = True
         release_store = _RankZeroReleaseStore(
             [RuntimeError("release timeout"), True])
         scheduler = None
         if mpi_rank() == 0:
             scheduler = RemoteG2KvCacheConnectorScheduler(
-                None,
-                binding_store=release_store,
-                plan_store=MagicMock())
+                None, binding_store=release_store, plan_store=MagicMock())
         manager = KvCacheConnectorManager(worker, scheduler)
         request = MagicMock(request_id=42)
         request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -589,9 +575,10 @@ def test_remote_g2_tp_rank0_release_exception_retries_before_finalization(
         result = KvCacheConnectorPollResult()
         for _ in range(3):
             result = manager.get_finished()
-            if result.failed_loading:
+            if result.failed_load_requests:
                 break
-        assert result == KvCacheConnectorPollResult(failed_loading=[request])
+        assert result == KvCacheConnectorPollResult(
+            failed_load_requests=[request])
         if scheduler is not None:
             assert release_store.calls == [
                 (42, "transfer_failed"),
@@ -602,7 +589,8 @@ def test_remote_g2_tp_rank0_release_exception_retries_before_finalization(
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-@pytest.mark.parametrize("release_outcomes", [[True], [RuntimeError("timeout"), True]])
+@pytest.mark.parametrize("release_outcomes",
+                         [[True], [RuntimeError("timeout"), True]])
 @pytest.mark.threadleak(enabled=False)
 def test_remote_g2_actual_worker_and_store_hold_lease_until_tp_failure_consensus(
         mpi_pool_executor, release_outcomes):
@@ -660,17 +648,15 @@ def test_remote_g2_actual_worker_and_store_hold_lease_until_tp_failure_consensus
         final = KvCacheConnectorPollResult()
         for _ in range(6):
             final = manager.get_finished()
-            if final.failed_loading:
+            if final.failed_load_requests:
                 break
-        assert final == KvCacheConnectorPollResult(failed_loading=[request])
+        assert final == KvCacheConnectorPollResult(
+            failed_load_requests=[request])
         if scheduler is not None:
-            assert scheduler_release_calls == [
-                ("lease-tp", "transfer_failed")
-            ] * len(release_outcomes)
-            assert sum(
-                not isinstance(outcome, BaseException)
-                for outcome in release_outcomes
-            ) == 1
+            assert scheduler_release_calls == [("lease-tp", "transfer_failed")
+                                               ] * len(release_outcomes)
+            assert sum(not isinstance(outcome, BaseException)
+                       for outcome in release_outcomes) == 1
 
     run_across_mpi(mpi_pool_executor, test, 2)
 
@@ -684,13 +670,12 @@ def test_remote_g2_actual_worker_success_releases_only_after_tp_consensus(
         record = _remote_g2_mpi_record()
         result = _RemoteG2MpiResult(
             record,
-            (RemoteG2TransferState.SUCCEEDED if mpi_rank() == 0 else
-             RemoteG2TransferState.IN_PROGRESS),
-            poll_states=(
-                () if mpi_rank() == 0 else (
-                    RemoteG2TransferState.IN_PROGRESS,
-                    RemoteG2TransferState.SUCCEEDED,
-                )),
+            (RemoteG2TransferState.SUCCEEDED
+             if mpi_rank() == 0 else RemoteG2TransferState.IN_PROGRESS),
+            poll_states=(() if mpi_rank() == 0 else (
+                RemoteG2TransferState.IN_PROGRESS,
+                RemoteG2TransferState.SUCCEEDED,
+            )),
         )
         worker = RemoteG2KvCacheConnectorWorker(
             None,
@@ -705,10 +690,8 @@ def test_remote_g2_actual_worker_success_releases_only_after_tp_consensus(
         scheduler = None
         if mpi_rank() == 0:
             binding_store = TargetRemoteG2BindingStore(
-                release_lease=lambda lease, reason: scheduler_release_calls.append(
-                    (lease, reason)
-                )
-                or True)
+                release_lease=lambda lease, reason: scheduler_release_calls.
+                append((lease, reason)) or True)
             binding_store._records[42] = record
             scheduler = RemoteG2KvCacheConnectorScheduler(
                 None,
@@ -726,7 +709,8 @@ def test_remote_g2_actual_worker_success_releases_only_after_tp_consensus(
             assert scheduler_release_calls == []
         assert manager.get_finished() == KvCacheConnectorPollResult()
         if scheduler is not None:
-            assert scheduler_release_calls == [("lease-tp", "transfer_succeeded")]
+            assert scheduler_release_calls == [("lease-tp",
+                                                "transfer_succeeded")]
         assert request.state != LlmRequestState.CONTEXT_INIT
         assert manager.get_finished() == KvCacheConnectorPollResult()
         assert request.state == LlmRequestState.CONTEXT_INIT
@@ -743,10 +727,10 @@ def test_connector_manager_cancellation_waits_for_every_rank_release(
         worker = MagicMock()
         worker.get_finished.return_value = ([], [])
         worker.take_failed_load_request_ids.return_value = set()
-        worker.abort_request.return_value = True
+        worker.try_abort_request.return_value = True
         scheduler = MagicMock() if mpi_rank() == 0 else None
         if scheduler is not None:
-            scheduler.abort_request.return_value = True
+            scheduler.try_abort_request.return_value = True
         manager = KvCacheConnectorManager(worker, scheduler)
         request = MagicMock(request_id=42)
         manager.new_async_requests.loading[42] = request
@@ -762,23 +746,24 @@ def test_connector_manager_cancellation_waits_for_every_rank_release(
         kv_cache_connector.mpi_allgather = counted_allgather
         try:
             if mpi_rank() == 0:
-                assert manager.request_abort(42, "cancelled") is False
+                assert manager.try_abort_request(42, "cancelled") is False
             else:
-                assert manager._local_abort_intents == {}
+                assert manager._request_coordination == {}
             for poll in range(3):
                 assert manager.get_finished() == KvCacheConnectorPollResult()
                 assert allgather_calls == poll + 1
                 if poll == 0:
-                    assert manager._global_abort_intents[42] == "cancelled"
+                    coordination = manager._request_coordination[42]
+                    assert coordination.consensus_abort_reason == "cancelled"
                     if mpi_rank() == 1:
-                        assert manager._local_abort_intents[42] == "cancelled"
+                        assert coordination.local_abort_reason == "cancelled"
         finally:
             kv_cache_connector.mpi_allgather = original_allgather
 
-        assert manager.request_abort(42, "cancelled") is True
-        assert worker.abort_request.call_count == 1
+        assert manager.try_abort_request(42, "cancelled") is True
+        assert worker.try_abort_request.call_count == 1
         if scheduler is not None:
-            scheduler.abort_request.assert_called_once_with(42, "cancelled")
+            scheduler.try_abort_request.assert_called_once_with(42, "cancelled")
 
     run_across_mpi(mpi_pool_executor, test, 2)
 
@@ -795,10 +780,10 @@ def test_connector_manager_retries_scheduler_cleanup(mpi_pool_executor,
         worker.get_finished.return_value = ([], [])
         worker.take_failed_load_request_ids.return_value = ({42} if mpi_rank()
                                                             == 0 else set())
-        worker.abort_request.return_value = True
+        worker.try_abort_request.return_value = True
         scheduler = MagicMock() if mpi_rank() == 0 else None
         if scheduler is not None:
-            scheduler.abort_request.side_effect = scheduler_outcomes
+            scheduler.try_abort_request.side_effect = scheduler_outcomes
         manager = KvCacheConnectorManager(worker, scheduler)
         request = MagicMock(request_id=42)
         manager.new_async_requests.loading[42] = request
@@ -808,9 +793,10 @@ def test_connector_manager_retries_scheduler_cleanup(mpi_pool_executor,
         assert manager.get_finished() == KvCacheConnectorPollResult()
         assert manager.get_finished() == KvCacheConnectorPollResult()
         result = manager.get_finished()
-        assert result == KvCacheConnectorPollResult(failed_loading=[request])
+        assert result == KvCacheConnectorPollResult(
+            failed_load_requests=[request])
         if scheduler is not None:
-            assert scheduler.abort_request.call_count == 2
+            assert scheduler.try_abort_request.call_count == 2
 
     run_across_mpi(mpi_pool_executor, test, 2)
 
@@ -850,12 +836,12 @@ def test_connector_manager_abort_release_error_is_same_on_all_ranks(
         worker = MagicMock()
         worker.get_finished.return_value = ([], [])
         worker.take_failed_load_request_ids.return_value = set()
-        worker.abort_request.side_effect = RuntimeError(
+        worker.try_abort_request.side_effect = RuntimeError(
             f"rank {mpi_rank()} release failed")
         scheduler = MagicMock() if mpi_rank() == 0 else None
         manager = KvCacheConnectorManager(worker, scheduler)
         manager.new_async_requests.loading[42] = MagicMock(request_id=42)
-        assert manager.request_abort(42, "cancelled") is False
+        assert manager.try_abort_request(42, "cancelled") is False
 
         assert manager.get_finished() == KvCacheConnectorPollResult()
         with pytest.raises(

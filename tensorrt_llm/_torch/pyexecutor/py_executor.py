@@ -772,7 +772,8 @@ class PyExecutor:
                     and not self.disable_overlap_scheduler):
                 raise NotImplementedError(
                     "The selected KV Cache Connector requires disable_overlap_scheduler=True; "
-                    "overlap scheduler retryable KV admission is not validated.")
+                    "overlap scheduler retryable KV admission is not validated."
+                )
 
             if (self.kv_connector_manager.requires_disable_attention_dp
                     and self.enable_attention_dp):
@@ -780,12 +781,13 @@ class PyExecutor:
                     "The selected KV Cache Connector requires enable_attention_dp=False; "
                     "attention-DP retryable KV admission is not validated.")
 
-            if (self.kv_connector_manager.requires_uniform_attention_window
-                    and (getattr(self.kv_cache_manager, 'is_vswa', False)
-                         or getattr(self.kv_cache_manager, 'is_linear_attention', False))):
+            if (self.kv_connector_manager.requires_uniform_attention_window and
+                (getattr(self.kv_cache_manager, 'is_vswa', False) or getattr(
+                    self.kv_cache_manager, 'is_linear_attention', False))):
                 raise NotImplementedError(
                     "The selected KV Cache Connector requires a single non-linear attention window; "
-                    "VSWA and linear-attention KV cache layouts are not validated.")
+                    "VSWA and linear-attention KV cache layouts are not validated."
+                )
 
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
             # Start the remote-G2 source-side service here, in the engine
@@ -808,8 +810,7 @@ class PyExecutor:
             except Exception:
                 import logging
                 logging.exception(
-                    "remote_g2: service bootstrap raised; continuing"
-                )
+                    "remote_g2: service bootstrap raised; continuing")
             try:
                 from .connectors.remote_g2_target_setup import (
                     maybe_start_remote_g2_target_client,
@@ -822,8 +823,7 @@ class PyExecutor:
             except Exception:
                 import logging
                 logging.exception(
-                    "remote_g2: target client bootstrap raised; continuing"
-                )
+                    "remote_g2: target client bootstrap raised; continuing")
             self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.
@@ -2781,16 +2781,16 @@ class PyExecutor:
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
             poll_result = self.kv_connector_manager.get_finished()
-            for req in poll_result.finished_saving:
+            for req in poll_result.finished_save_requests:
                 self._end_transfer_and_maybe_terminate(req)
-            if poll_result.failed_loading:
-                for req in poll_result.failed_loading:
-                    self._kv_connector_disable_reuse_store(req)
+            if poll_result.failed_load_requests:
+                for req in poll_result.failed_load_requests:
+                    self._prevent_kv_reuse_for_request(req)
                 self._handle_errors("KV cache load failure",
-                                    requests=poll_result.failed_loading,
+                                    requests=poll_result.failed_load_requests,
                                     charge_budget=False)
 
-    def _kv_connector_disable_reuse_store(self, request: LlmRequest):
+    def _prevent_kv_reuse_for_request(self, request: LlmRequest):
         """Prevent a failed connector load's never-validated blocks from being
         stored for reuse (they hold garbage, not the matched prefix's KV)."""
         try:
@@ -5062,15 +5062,17 @@ class PyExecutor:
             bool: True when connector and applicable transceiver cleanup are
                 both complete.
         """
-        connector_done = (self.kv_connector_manager is None
-                          or self.kv_connector_manager.request_abort(
-                              request.request_id, "cancelled"))
-        transceiver_done = True
+        connector_cleanup_complete = (
+            self.kv_connector_manager is None
+            or self.kv_connector_manager.try_abort_request(
+                request.request_id, "cancelled"))
+        transceiver_cleanup_complete = True
         if (self.kv_cache_transceiver is not None
                 and self._is_request_in_transmission(request)):
-            transceiver_done = self.kv_cache_transceiver.cancel_request(request)
+            transceiver_cleanup_complete = self.kv_cache_transceiver.cancel_request(
+                request)
 
-        return connector_done and transceiver_done
+        return connector_cleanup_complete and transceiver_cleanup_complete
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):

@@ -34,7 +34,7 @@ def test_kv_connector_poll_terminates_saves_and_fails_only_failed_loads():
     executor.active_requests = [failed_load, unrelated]
     executor.kv_connector_manager = MagicMock()
     executor.kv_connector_manager.get_finished.return_value = KvCacheConnectorPollResult(
-        finished_saving=[finished_save], failed_loading=[failed_load]
+        finished_save_requests=[finished_save], failed_load_requests=[failed_load]
     )
     executor._end_transfer_and_maybe_terminate = MagicMock()
     executor._error_budget = MagicMock()
@@ -43,8 +43,8 @@ def test_kv_connector_poll_terminates_saves_and_fails_only_failed_loads():
     executor._enqueue_responses = MagicMock()
     termination_positions = []
     executor._terminate_request = MagicMock(
-        side_effect=lambda request: termination_positions.append(
-            request.context_current_position))
+        side_effect=lambda request: termination_positions.append(request.context_current_position)
+    )
     failed_load.py_request_id = 42
     failed_load.py_client_id = 7
     failed_load.context_current_position = 128
@@ -82,7 +82,7 @@ def test_try_cancel_request_requires_connector_and_transceiver_cleanup(
 ):
     executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = MagicMock()
-    executor.kv_connector_manager.request_abort.return_value = connector_result
+    executor.kv_connector_manager.try_abort_request.return_value = connector_result
     executor.kv_cache_transceiver = MagicMock()
     executor.kv_cache_transceiver.cancel_request.return_value = transceiver_result
     request = MagicMock()
@@ -91,7 +91,7 @@ def test_try_cancel_request_requires_connector_and_transceiver_cleanup(
 
     assert executor._try_cancel_request(request) is expected
 
-    executor.kv_connector_manager.request_abort.assert_called_once_with(17, "cancelled")
+    executor.kv_connector_manager.try_abort_request.assert_called_once_with(17, "cancelled")
     executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
 
 
@@ -101,7 +101,7 @@ def test_try_cancel_request_returns_connector_result_without_transceiver(
 ):
     executor = object.__new__(PyExecutor)
     executor.kv_connector_manager = MagicMock()
-    executor.kv_connector_manager.request_abort.return_value = connector_result
+    executor.kv_connector_manager.try_abort_request.return_value = connector_result
     executor.kv_cache_transceiver = None
     request = MagicMock()
     request.request_id = 23
@@ -109,7 +109,7 @@ def test_try_cancel_request_returns_connector_result_without_transceiver(
 
     assert executor._try_cancel_request(request) is connector_result
 
-    executor.kv_connector_manager.request_abort.assert_called_once_with(23, "cancelled")
+    executor.kv_connector_manager.try_abort_request.assert_called_once_with(23, "cancelled")
 
 
 def test_handle_canceled_requests_retains_id_until_all_cleanup_finishes():
@@ -117,7 +117,7 @@ def test_handle_canceled_requests_retains_id_until_all_cleanup_finishes():
     executor.canceled_req_ids = [29]
     executor.waiting_queue = MagicMock()
     executor.kv_connector_manager = MagicMock()
-    executor.kv_connector_manager.request_abort.side_effect = [False, True, True]
+    executor.kv_connector_manager.try_abort_request.side_effect = [False, True, True]
     executor.kv_cache_transceiver = MagicMock()
     executor.kv_cache_transceiver.cancel_request.side_effect = [True, False, True]
     request = MagicMock()
@@ -140,7 +140,7 @@ def test_handle_canceled_requests_retains_id_until_all_cleanup_finishes():
     executor._handle_canceled_requests()
 
     assert executor.canceled_req_ids == []
-    assert executor.kv_connector_manager.request_abort.call_args_list == [
+    assert executor.kv_connector_manager.try_abort_request.call_args_list == [
         ((31, "cancelled"),),
         ((31, "cancelled"),),
         ((31, "cancelled"),),

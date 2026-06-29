@@ -250,10 +250,10 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         self._release_and_forget(request.request_id, "request_finished")
         return False
 
-    def abort_request(self, request_id: int, reason: str) -> bool:
+    def try_abort_request(self, request_id: int, reason: str) -> bool:
         return self._release_and_forget(request_id, reason)
 
-    def finish_load(self, request_id: int) -> bool:
+    def finalize_successful_load(self, request_id: int) -> bool:
         return self._release_and_forget(request_id, "transfer_succeeded")
 
     def _release_and_forget(self, request_id: int, reason: str) -> bool:
@@ -302,8 +302,8 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         self._explicit_publish_binding = publish_binding
         self._transfer_timeout_ms = transfer_timeout_ms
         self._observability = observability or NullRemoteG2ObservabilitySink()
-        self._active_loads: dict[int | str, _RemoteG2Load] = {}
-        self._terminal_bindings: set[tuple[Optional[str], str, int]] = set()
+        self._active_loads: dict[int | str, _RemoteG2LoadAttempt] = {}
+        self._terminal_binding_fingerprints: set[tuple[Optional[str], str, int]] = set()
         self._failed_load_request_ids: set[int] = set()
 
     @property
@@ -330,10 +330,10 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
     def start_load_kv(self, stream: Any) -> None:
         metadata = self.get_connector_meta()
         if not isinstance(metadata, RemoteG2ConnectorMetadata):
-            self._terminal_bindings.clear()
+            self._terminal_binding_fingerprints.clear()
             return
         current_fingerprints = {self._binding_fingerprint(record) for record in metadata.bindings}
-        self._terminal_bindings.intersection_update(current_fingerprints)
+        self._terminal_binding_fingerprints.intersection_update(current_fingerprints)
         if not metadata.bindings:
             return
 
@@ -341,10 +341,10 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
             request_id = record.request_id
             if (
                 request_id in self._active_loads
-                or self._binding_fingerprint(record) in self._terminal_bindings
+                or self._binding_fingerprint(record) in self._terminal_binding_fingerprints
             ):
                 continue
-            load = _RemoteG2Load(
+            load = _RemoteG2LoadAttempt(
                 record=record,
                 state=_RemoteG2LoadState.STARTING,
                 started_at_ms=_now_ms(),
@@ -352,10 +352,10 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
             self._active_loads[request_id] = load
             adapter = self._transfer_adapter
             if adapter is None:
-                self._fail(load, "transfer_adapter_missing")
+                self._mark_load_failed(load, "transfer_adapter_missing")
                 continue
-            if not bool(getattr(adapter, "supports_synchronous_release", False)):
-                self._fail(load, "transfer_adapter_incapable")
+            if not bool(getattr(adapter, "supports_retryable_release", False)):
+                self._mark_load_failed(load, "transfer_adapter_incapable")
                 continue
             try:
                 result = adapter.start_transfer(record)
@@ -368,7 +368,7 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
                         load.release_contract_valid = True
                     except Exception:
                         pass
-                self._fail(load, "transfer_start_failed")
+                self._mark_load_failed(load, "transfer_start_failed")
                 continue
             load.result = result
             try:
@@ -378,15 +378,15 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
             except Exception:
                 # Ownership may already have crossed into the adapter.  An
                 # invalid result cannot prove that handle cleanup is safe.
-                self._fail(load, "transfer_result_unsafe")
+                self._mark_load_failed(load, "transfer_result_unsafe")
                 continue
             load.release_contract_valid = True
             if start_error is not None:
-                self._fail(load, "transfer_start_failed")
+                self._mark_load_failed(load, "transfer_start_failed")
             elif initial_state is RemoteG2TransferState.FAILED:
-                self._fail(load, "transfer_failed")
+                self._mark_load_failed(load, "transfer_failed")
             elif initial_state is RemoteG2TransferState.SUCCEEDED:
-                load.state = _RemoteG2LoadState.SUCCESS_CLEANUP
+                load.state = _RemoteG2LoadState.SUCCEEDED_PENDING_CLEANUP
             else:
                 load.state = _RemoteG2LoadState.ACTIVE
 
@@ -419,17 +419,17 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
                 try:
                     state = load.result.poll_state()
                 except Exception:
-                    self._fail(load, "transfer_poll_failed")
+                    self._mark_load_failed(load, "transfer_poll_failed")
                 else:
                     if state is RemoteG2TransferState.SUCCEEDED:
-                        load.state = _RemoteG2LoadState.SUCCESS_CLEANUP
+                        load.state = _RemoteG2LoadState.SUCCEEDED_PENDING_CLEANUP
                     elif state is RemoteG2TransferState.FAILED:
-                        self._fail(load, "transfer_failed")
+                        self._mark_load_failed(load, "transfer_failed")
                     elif state is not RemoteG2TransferState.IN_PROGRESS:
-                        self._fail(load, "transfer_state_invalid")
+                        self._mark_load_failed(load, "transfer_state_invalid")
                     elif _now_ms() - load.started_at_ms > self._transfer_timeout_ms:
-                        self._fail(load, "transfer_timeout")
-            if self._drive_cleanup(load):
+                        self._mark_load_failed(load, "transfer_timeout")
+            if self._advance_load_cleanup(load):
                 self._finalize_load(request_id, load, finished_loading)
         return ([], finished_loading)
 
@@ -438,78 +438,81 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         self._failed_load_request_ids = set()
         return failed
 
-    def abort_request(self, request_id: int) -> bool:
+    def try_abort_request(self, request_id: int) -> bool:
         load = self._active_loads.get(request_id)
         if load is None:
             return True
-        if load.state is not _RemoteG2LoadState.FAILED_CLEANUP:
-            load.state = _RemoteG2LoadState.ABORT_CLEANUP
+        if load.state is not _RemoteG2LoadState.FAILED_PENDING_CLEANUP:
+            load.state = _RemoteG2LoadState.ABORTED_PENDING_CLEANUP
             load.failure_reason = "cancelled"
-        self._drive_cleanup(load)
+        self._advance_load_cleanup(load)
         self._finalize_load(request_id, load, [])
         return True
 
-    def _fail(self, load: "_RemoteG2Load", reason: str) -> None:
-        first_failure = load.state is not _RemoteG2LoadState.FAILED_CLEANUP
-        load.state = _RemoteG2LoadState.FAILED_CLEANUP
+    def _mark_load_failed(self, load: "_RemoteG2LoadAttempt", reason: str) -> None:
+        first_failure = load.state is not _RemoteG2LoadState.FAILED_PENDING_CLEANUP
+        load.state = _RemoteG2LoadState.FAILED_PENDING_CLEANUP
         load.failure_reason = reason
         if first_failure:
             self._failed_load_request_ids.add(int(load.record.request_id))
 
-    def _drive_cleanup(self, load: "_RemoteG2Load") -> bool:
+    def _advance_load_cleanup(self, load: "_RemoteG2LoadAttempt") -> bool:
         if load.state in {_RemoteG2LoadState.STARTING, _RemoteG2LoadState.ACTIVE}:
             return False
         if load.result is not None:
-            self._release_handle(load)
+            self._release_transfer_handle(load)
 
-        if load.state is _RemoteG2LoadState.SUCCESS_CLEANUP:
-            if not load.local_valid_attempted:
-                load.local_valid_attempted = True
+        if load.state is _RemoteG2LoadState.SUCCEEDED_PENDING_CLEANUP:
+            if not load.mark_local_valid_attempted:
+                load.mark_local_valid_attempted = True
                 if self._mark_local_valid is None:
-                    self._fail(load, "local_validity_missing")
+                    self._mark_load_failed(load, "local_validity_missing")
                 else:
                     try:
                         self._mark_local_valid(load.record)
                         load.local_valid_marked = True
                     except Exception:
-                        self._fail(load, "local_validity_failed")
-            if load.state is _RemoteG2LoadState.SUCCESS_CLEANUP and not load.publish_attempted:
-                load.publish_attempted = True
+                        self._mark_load_failed(load, "local_validity_failed")
+            if (
+                load.state is _RemoteG2LoadState.SUCCEEDED_PENDING_CLEANUP
+                and not load.publish_binding_attempted
+            ):
+                load.publish_binding_attempted = True
                 if self._publish_binding is None:
-                    self._fail(load, "publication_missing")
+                    self._mark_load_failed(load, "publication_missing")
                 else:
                     try:
                         self._publish_binding(load.record)
-                        load.published = True
+                        load.binding_published = True
                     except Exception:
-                        self._fail(load, "publication_failed")
+                        self._mark_load_failed(load, "publication_failed")
 
         return True
 
-    def _release_handle(self, load: "_RemoteG2Load") -> None:
+    def _release_transfer_handle(self, load: "_RemoteG2LoadAttempt") -> None:
         if not load.release_contract_valid:
             raise RuntimeError("remote_g2: transfer handle release contract is unavailable")
-        quiesce = getattr(load.result, "quiesce", None)
-        if not callable(quiesce):
+        release_transfer = getattr(load.result, "release_transfer", None)
+        if not callable(release_transfer):
             raise RuntimeError("remote_g2: transfer result has no handle release operation")
-        if quiesce() is not True:
-            raise RuntimeError("remote_g2: transfer handle release did not prove quiescence")
+        if release_transfer() is not True:
+            raise RuntimeError("remote_g2: transfer handle release did not confirm release")
 
     def _finalize_load(
         self,
         request_id: int | str,
-        load: "_RemoteG2Load",
+        load: "_RemoteG2LoadAttempt",
         finished_loading: list[int],
     ) -> None:
         self._active_loads.pop(request_id, None)
-        self._terminal_bindings.add(self._binding_fingerprint(load.record))
+        self._terminal_binding_fingerprints.add(self._binding_fingerprint(load.record))
         reason = load.failure_reason or "transfer_succeeded"
-        if load.state is _RemoteG2LoadState.SUCCESS_CLEANUP:
+        if load.state is _RemoteG2LoadState.SUCCEEDED_PENDING_CLEANUP:
             self._emit_record_event("transferred", load.record, reason="ok", outcome="completed")
             finished_loading.append(int(request_id))
-        elif load.state is _RemoteG2LoadState.FAILED_CLEANUP:
+        elif load.state is _RemoteG2LoadState.FAILED_PENDING_CLEANUP:
             self._emit_record_event("failed", load.record, reason=reason, outcome="request_failed")
-        elif load.state is _RemoteG2LoadState.ABORT_CLEANUP:
+        elif load.state is _RemoteG2LoadState.ABORTED_PENDING_CLEANUP:
             self._emit_record_event("failed", load.record, reason=reason, outcome="request_aborted")
 
     @staticmethod
@@ -549,23 +552,23 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
 class _RemoteG2LoadState(Enum):
     STARTING = "starting"
     ACTIVE = "active"
-    SUCCESS_CLEANUP = "success_cleanup"
-    FAILED_CLEANUP = "failed_cleanup"
-    ABORT_CLEANUP = "abort_cleanup"
+    SUCCEEDED_PENDING_CLEANUP = "succeeded_pending_cleanup"
+    FAILED_PENDING_CLEANUP = "failed_pending_cleanup"
+    ABORTED_PENDING_CLEANUP = "aborted_pending_cleanup"
 
 
 @dataclass
-class _RemoteG2Load:
+class _RemoteG2LoadAttempt:
     record: RemoteG2BindingRecord
     state: _RemoteG2LoadState
     started_at_ms: int
     result: Any = None
     failure_reason: Optional[str] = None
     release_contract_valid: bool = False
-    local_valid_attempted: bool = False
+    mark_local_valid_attempted: bool = False
     local_valid_marked: bool = False
-    publish_attempted: bool = False
-    published: bool = False
+    publish_binding_attempted: bool = False
+    binding_published: bool = False
 
 
 def _now_ms() -> int:

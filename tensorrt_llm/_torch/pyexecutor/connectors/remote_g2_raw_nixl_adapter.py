@@ -174,7 +174,7 @@ class RawNixlRemoteG2Adapter:
     the raw NIXL agent metadata bytes.
     """
 
-    supports_synchronous_release = True
+    supports_retryable_release = True
 
     def __init__(
         self,
@@ -600,7 +600,7 @@ class _RawNixlTransferResult:
                 return False
             time.sleep(0.001)
 
-    def quiesce(self) -> bool:
+    def release_transfer(self) -> bool:
         if self._released:
             return True
         self.agent.release_xfer_handle(self.handle)
@@ -608,4 +608,4 @@ class _RawNixlTransferResult:
         return True
 
     def release(self) -> None:
-        self.quiesce()
+        self.release_transfer()

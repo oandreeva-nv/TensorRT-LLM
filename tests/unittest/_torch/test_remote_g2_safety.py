@@ -141,13 +141,13 @@ class _FakeTransferResult:
             else TRANSFER.RemoteG2TransferState.IN_PROGRESS
         )
 
-    def quiesce(self):
+    def release_transfer(self):
         self.released += 1
         return True
 
 
 class _FakeTransferAdapter:
-    supports_synchronous_release = True
+    supports_retryable_release = True
 
     def __init__(self, result_factory=None):
         self.started = []
@@ -588,7 +588,7 @@ def test_remote_g2_capable_adapter_metadata_mismatch_is_a_request_failure():
     )
     # Exercise the pre-handle metadata/start failure path independently of
     # the production legacy-adapter capability rejection.
-    adapter.supports_synchronous_release = True
+    adapter.supports_retryable_release = True
     worker = CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
         transfer_adapter=adapter,
@@ -619,7 +619,7 @@ def test_remote_g2_handle_release_is_exactly_once_per_attempt():
     worker.start_load_kv(None)
 
     assert worker.get_finished([], [1234]) == ([], [1234])
-    assert worker.abort_request(1234) is True
+    assert worker.try_abort_request(1234) is True
     assert result.released == 1
 
 

@@ -131,7 +131,7 @@ def test_raw_result_poll_err_fails_immediately():
     assert result.poll_state() is RAW.RemoteG2TransferState.FAILED
 
 
-def test_raw_result_quiesce_failure_is_fatal():
+def test_raw_result_release_transfer_failure_is_fatal():
     agent = _FakeAgent(release_results=[RuntimeError("release failed")])
     result = RAW._RawNixlTransferResult(
         agent=agent,
@@ -141,11 +141,11 @@ def test_raw_result_quiesce_failure_is_fatal():
     )
 
     with pytest.raises(RuntimeError, match="release failed"):
-        result.quiesce()
+        result.release_transfer()
     assert agent.release_calls == 1
 
 
-def test_raw_result_quiesce_success_is_idempotent():
+def test_raw_result_release_transfer_success_is_idempotent():
     agent = _FakeAgent(release_results=[None])
     result = RAW._RawNixlTransferResult(
         agent=agent,
@@ -154,8 +154,8 @@ def test_raw_result_quiesce_success_is_idempotent():
         initial_state=RAW.RemoteG2TransferState.SUCCEEDED,
     )
 
-    assert result.quiesce() is True
-    assert result.quiesce() is True
+    assert result.release_transfer() is True
+    assert result.release_transfer() is True
     assert agent.release_calls == 1
 
 
@@ -199,7 +199,7 @@ def test_raw_adapter_transfer_raise_after_handle_creation_retains_retryable_hand
     assert result.handle is adapter._agent.handle
     assert result.initial_state is RAW.RemoteG2TransferState.FAILED
     assert isinstance(result.start_error, RuntimeError)
-    assert result.quiesce() is True
+    assert result.release_transfer() is True
 
 
 def test_unsafe_result_contract_is_rejected_without_losing_live_result():
@@ -212,5 +212,5 @@ def test_unsafe_result_contract_is_rejected_without_losing_live_result():
 
 
 def test_adapter_capabilities_are_explicit():
-    assert TRANSFER.RemoteG2NixlTransferAdapter.supports_synchronous_release is False
-    assert RAW.RawNixlRemoteG2Adapter.supports_synchronous_release is True
+    assert TRANSFER.RemoteG2NixlTransferAdapter.supports_retryable_release is False
+    assert RAW.RawNixlRemoteG2Adapter.supports_retryable_release is True

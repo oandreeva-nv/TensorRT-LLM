@@ -170,13 +170,13 @@ class _FakeTransferResult:
             else REMOTE_G2_CONNECTOR.RemoteG2TransferState.IN_PROGRESS
         )
 
-    def quiesce(self):
+    def release_transfer(self):
         self.released += 1
         return True
 
 
 class _FakeTransferAdapter:
-    supports_synchronous_release = True
+    supports_retryable_release = True
 
     def __init__(self, result_factory=None):
         self.started = []
@@ -328,8 +328,8 @@ def test_remote_g2_scheduler_abort_releases_once_then_forgets_binding_and_plan()
         None, plan_store=plan_store, binding_store=binding_store
     )
 
-    assert scheduler.abort_request(1234, "transfer_failed") is True
-    assert scheduler.abort_request(1234, "transfer_failed") is True
+    assert scheduler.try_abort_request(1234, "transfer_failed") is True
+    assert scheduler.try_abort_request(1234, "transfer_failed") is True
     assert binding_store.get(1234) is None
     assert plan_store.get(1234) is None
     assert released == [("lease-abort", "transfer_failed")]
@@ -345,7 +345,7 @@ def test_remote_g2_scheduler_abort_retries_genuine_cleanup_failure():
         plan_store=TargetRemotePlanStore(clock_ms=lambda: 500),
         binding_store=FailingBindingStore(),
     )
-    assert scheduler.abort_request(1234, "transfer_failed") is False
+    assert scheduler.try_abort_request(1234, "transfer_failed") is False
 
 
 def test_remote_g2_scheduler_release_exception_retries_before_forgetting():
@@ -369,10 +369,10 @@ def test_remote_g2_scheduler_release_exception_retries_before_forgetting():
         None, plan_store=plan_store, binding_store=binding_store
     )
 
-    assert scheduler.abort_request(1234, "transfer_failed") is False
+    assert scheduler.try_abort_request(1234, "transfer_failed") is False
     assert binding_store.get(1234) is not None
     assert plan_store.get(1234) is not None
-    assert scheduler.abort_request(1234, "transfer_failed") is True
+    assert scheduler.try_abort_request(1234, "transfer_failed") is True
     assert binding_store.get(1234) is None
     assert plan_store.get(1234) is None
     assert released == [
@@ -395,15 +395,13 @@ def test_remote_g2_scheduler_finish_false_release_is_definitive_and_idempotent()
         None, plan_store=plan_store, binding_store=binding_store
     )
 
-    assert scheduler.finish_load(1234) is True
-    assert scheduler.finish_load(1234) is True
+    assert scheduler.finalize_successful_load(1234) is True
+    assert scheduler.finalize_successful_load(1234) is True
     assert released == [("lease-absent", "transfer_succeeded")]
 
 
 def test_remote_g2_worker_refuses_transfer_before_phase5():
-    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
-        None
-    )
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(None)
 
     worker.bind_connector_meta(RemoteG2ConnectorMetadata())
     worker.start_load_kv(None)
@@ -598,13 +596,13 @@ def test_remote_g2_worker_observability_never_logs_raw_descriptors():
 
 
 class _ScriptedResult:
-    def __init__(self, record, states, quiesce=(True,), start_error=None):
+    def __init__(self, record, states, release_transfer=(True,), start_error=None):
         self.record = record
         self.initial_state = states[0]
         self._states = list(states[1:])
-        self._quiesce = list(quiesce)
+        self._release_transfer_outcomes = list(release_transfer)
         self.start_error = start_error
-        self.quiesce_calls = 0
+        self.release_transfer_calls = 0
 
     def poll_state(self):
         state = self._states.pop(0) if self._states else self.initial_state
@@ -612,16 +610,16 @@ class _ScriptedResult:
             raise state
         return state
 
-    def quiesce(self):
-        self.quiesce_calls += 1
-        result = self._quiesce.pop(0) if self._quiesce else True
+    def release_transfer(self):
+        self.release_transfer_calls += 1
+        result = self._release_transfer_outcomes.pop(0) if self._release_transfer_outcomes else True
         if isinstance(result, BaseException):
             raise result
         return result
 
 
 class _ScriptedAdapter:
-    supports_synchronous_release = True
+    supports_retryable_release = True
 
     def __init__(self, start):
         self.start = start
@@ -633,9 +631,7 @@ class _ScriptedAdapter:
 def test_remote_g2_start_exception_releases_handle_and_continues_bindings():
     failed = _bound_record("lease-failed", 1234)
     succeeded = _bound_record("lease-ok", 5678)
-    failed_result = _ScriptedResult(
-        failed, [REMOTE_G2_TRANSFER.RemoteG2TransferState.IN_PROGRESS]
-    )
+    failed_result = _ScriptedResult(failed, [REMOTE_G2_TRANSFER.RemoteG2TransferState.IN_PROGRESS])
 
     class StartError(RuntimeError):
         transfer_result = failed_result
@@ -656,7 +652,7 @@ def test_remote_g2_start_exception_releases_handle_and_continues_bindings():
 
     assert worker.get_finished([], [1234, 5678]) == ([], [5678])
     assert worker.take_failed_load_request_ids() == {1234}
-    assert failed_result.quiesce_calls == 1
+    assert failed_result.release_transfer_calls == 1
 
 
 def test_remote_g2_initial_failure_and_failed_notifications_drain_once():
@@ -689,10 +685,10 @@ def test_remote_g2_abort_releases_handle_once():
     worker.bind_connector_meta(RemoteG2ConnectorMetadata((record,)))
     worker.start_load_kv(None)
 
-    assert worker.abort_request(9999) is True
-    assert worker.abort_request(1234) is True
-    assert worker.abort_request(1234) is True
-    assert result.quiesce_calls == 1
+    assert worker.try_abort_request(9999) is True
+    assert worker.try_abort_request(1234) is True
+    assert worker.try_abort_request(1234) is True
+    assert result.release_transfer_calls == 1
     aborted = [event for event in sink.events if event.outcome == "request_aborted"]
     assert len(aborted) == 1
     assert aborted[0].reason == "cancelled"
@@ -704,9 +700,9 @@ def test_remote_g2_success_cleanup_order_and_hooks_run_once():
     order = []
 
     class Result(_ScriptedResult):
-        def quiesce(self):
-            order.append("quiesce")
-            return super().quiesce()
+        def release_transfer(self):
+            order.append("release_transfer")
+            return super().release_transfer()
 
     result = Result(record, [REMOTE_G2_TRANSFER.RemoteG2TransferState.SUCCEEDED])
     worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
@@ -720,22 +716,22 @@ def test_remote_g2_success_cleanup_order_and_hooks_run_once():
 
     assert worker.get_finished([], [1234]) == ([], [1234])
     assert worker.get_finished([], []) == ([], [])
-    assert order == ["quiesce", "valid", "publish"]
+    assert order == ["release_transfer", "valid", "publish"]
 
 
 @pytest.mark.parametrize(
-    "quiesce_outcome,match",
+    "release_transfer_outcome,match",
     [
-        (False, "did not prove quiescence"),
+        (False, "did not confirm release"),
         (RuntimeError("release failed"), "release failed"),
     ],
 )
-def test_remote_g2_release_failure_is_fatal(quiesce_outcome, match):
+def test_remote_g2_release_failure_is_fatal(release_transfer_outcome, match):
     record = _bound_record()
     result = _ScriptedResult(
         record,
         [REMOTE_G2_TRANSFER.RemoteG2TransferState.FAILED],
-        quiesce=(quiesce_outcome,),
+        release_transfer=(release_transfer_outcome,),
     )
     worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
@@ -746,7 +742,7 @@ def test_remote_g2_release_failure_is_fatal(quiesce_outcome, match):
 
     with pytest.raises(RuntimeError, match=match):
         worker.get_finished([], [1234])
-    assert result.quiesce_calls == 1
+    assert result.release_transfer_calls == 1
 
 
 @pytest.mark.parametrize("failing_hook", ["mark", "publish"])
@@ -789,6 +785,7 @@ def test_remote_g2_rejects_incapable_adapter():
     worker.get_finished([], [1234])
     assert worker.take_failed_load_request_ids() == {1234}
 
+
 def test_remote_g2_reused_request_id_starts_new_binding_and_prunes_terminals():
     adapter = _FakeTransferAdapter()
     worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
@@ -810,11 +807,11 @@ def test_remote_g2_reused_request_id_starts_new_binding_and_prunes_terminals():
     worker.start_load_kv(None)
     assert worker.get_finished([], [1234]) == ([], [1234])
     assert adapter.started == [first, second]
-    assert len(worker._terminal_bindings) == 1
+    assert len(worker._terminal_binding_fingerprints) == 1
 
     worker.bind_connector_meta(RemoteG2ConnectorMetadata())
     worker.start_load_kv(None)
-    assert worker._terminal_bindings == set()
+    assert worker._terminal_binding_fingerprints == set()
 
 
 # Remote-G2 relies on retryable KV admission, but no longer requires disabling
