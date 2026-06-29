@@ -92,6 +92,7 @@ def build_raw_nixl_source_agent(
     # discovers them automatically when given just the agent name.
     # For our same-host case, the IP is the container's IP.
     import socket
+
     try:
         # NIXL's listener binds on all interfaces. We need the container's
         # routable IP. Use a UDP socket trick to discover ourselves.
@@ -137,6 +138,7 @@ def _extract_listen_port_from_metadata(metadata: bytes) -> Optional[int]:
         # Try common ports range — most likely format embeds ASCII port.
         printable = metadata.decode("latin-1", errors="ignore")
         import re
+
         m = re.search(r":(\d{4,5})\b", printable)
         if m:
             port = int(m.group(1))
@@ -206,8 +208,7 @@ class RawNixlRemoteG2Adapter:
             )
         except Exception:
             logging.exception(
-                "remote_g2: raw nixl primary pool register_memory failed "
-                "(ptr=0x%x size=%d)",
+                "remote_g2: raw nixl primary pool register_memory failed (ptr=0x%x size=%d)",
                 primary_pool_base_ptr,
                 primary_pool_size_bytes,
             )
@@ -244,19 +245,17 @@ class RawNixlRemoteG2Adapter:
         # memory regions).
         peer_metadata = source_meta.get("agent_metadata")
         if not peer_metadata:
-            raise RuntimeError(
-                f"remote_g2: peer {peer_name} metadata missing from source response"
-            )
+            raise RuntimeError(f"remote_g2: peer {peer_name} metadata missing from source response")
         loaded_name_raw = self._agent.add_remote_agent(peer_metadata)
         # add_remote_agent returns bytes; decode for string comparison.
         loaded_name = (
-            loaded_name_raw.decode() if isinstance(loaded_name_raw, bytes)
-            else loaded_name_raw
+            loaded_name_raw.decode() if isinstance(loaded_name_raw, bytes) else loaded_name_raw
         )
         if loaded_name != peer_name:
             logging.warning(
                 "remote_g2: add_remote_agent returned %r but expected %r",
-                loaded_name, peer_name,
+                loaded_name,
+                peer_name,
             )
         logging.info(
             "[NIXL-XFER] peer_loaded: local_agent=%s remote_agent=%s "
@@ -298,8 +297,7 @@ class RawNixlRemoteG2Adapter:
         remote_pool_size = int(source_meta["pool_size_bytes"])
         remote_num_blocks = remote_pool_size // block_size if block_size else 0
         remote_descs = [
-            (remote_pool_base + i * block_size, block_size, 0)
-            for i in range(remote_num_blocks)
+            (remote_pool_base + i * block_size, block_size, 0) for i in range(remote_num_blocks)
         ]
         remote_handle = self._agent.prep_xfer_dlist(
             peer_name,
@@ -309,9 +307,11 @@ class RawNixlRemoteG2Adapter:
 
         self._peer_handles[key] = (local_handle, remote_handle)
         logging.warning(
-            "PROBE remote_g2_raw_peer_loaded peer=%s gen=%d "
-            "local_blocks=%d remote_blocks=%d",
-            peer_name, peer_generation, num_blocks, remote_num_blocks,
+            "PROBE remote_g2_raw_peer_loaded peer=%s gen=%d local_blocks=%d remote_blocks=%d",
+            peer_name,
+            peer_generation,
+            num_blocks,
+            remote_num_blocks,
         )
         return local_handle, remote_handle
 
@@ -442,9 +442,9 @@ class RawNixlRemoteG2Adapter:
                 remote_indices.append(src_offset // block_size)
 
         logging.warning(
-            "PROBE remote_g2_raw_make_prepped request_id=%s blocks=%d "
-            "local_head=%d remote_head=%d",
-            record.request_id, len(local_indices),
+            "PROBE remote_g2_raw_make_prepped request_id=%s blocks=%d local_head=%d remote_head=%d",
+            record.request_id,
+            len(local_indices),
             local_indices[0] if local_indices else -1,
             remote_indices[0] if remote_indices else -1,
         )
@@ -490,7 +490,8 @@ class RawNixlRemoteG2Adapter:
                 _nvtx.range_pop()
         logging.warning(
             "PROBE remote_g2_raw_transfer_submitted request_id=%s initial_state=%s",
-            record.request_id, state,
+            record.request_id,
+            state,
         )
         logging.info(
             "[NIXL-XFER] submitted: request_id=%s tp_rank=%d "
@@ -548,6 +549,7 @@ class _RawNixlTransferResult:
 
     def wait(self, timeout_ms: Optional[int] = None) -> bool:
         import time
+
         deadline = None if timeout_ms is None else time.monotonic() + timeout_ms / 1000.0
         while True:
             state = self.agent.check_xfer_state(self.handle)

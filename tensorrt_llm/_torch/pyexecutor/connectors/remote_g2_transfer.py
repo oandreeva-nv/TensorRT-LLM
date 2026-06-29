@@ -32,9 +32,7 @@ class RemoteG2TransferDescriptor:
     name: str = ""
 
     @classmethod
-    def from_source_descriptor(
-        cls, descriptor: RemoteG2Descriptor
-    ) -> "RemoteG2TransferDescriptor":
+    def from_source_descriptor(cls, descriptor: RemoteG2Descriptor) -> "RemoteG2TransferDescriptor":
         metadata = descriptor.metadata
         raw = metadata.get("nixl_memory_desc")
         if isinstance(raw, Mapping):

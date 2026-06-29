@@ -64,9 +64,9 @@ def _assert_partial_reuse_disabled(llm_args: Any) -> None:
 # remote_g2_target_setup.maybe_start_remote_g2_target_client). The
 # connector scheduler/worker read these lazily at call time so that
 # installation order vs. construction order doesn't matter.
-_installed_resolve_and_lease: Optional[
-    Callable[["RemoteKvReusePlan"], "RemoteG2ResolveResult"]
-] = None
+_installed_resolve_and_lease: Optional[Callable[["RemoteKvReusePlan"], "RemoteG2ResolveResult"]] = (
+    None
+)
 _installed_release_lease: Optional[Callable[[str, str], bool]] = None
 _installed_transfer_adapter: Optional[Any] = None
 _installed_mark_local_valid: Optional[Callable[[RemoteG2BindingRecord], None]] = None
@@ -75,21 +75,15 @@ _installed_publish_binding: Optional[Callable[[RemoteG2BindingRecord], None]] = 
 # target setup once the KV cache manager is available. The binding store
 # calls this when binding so NIXL's local dlist gets the right
 # dense per-slot index instead of the engine's globally-unique block_id.
-_installed_block_id_to_slot_idx: Optional[
-    Callable[[list[int]], list[int]]
-] = None
+_installed_block_id_to_slot_idx: Optional[Callable[[list[int]], list[int]]] = None
 
 
-def install_block_id_to_slot_idx(
-    fn: Callable[[list[int]], list[int]]
-) -> None:
+def install_block_id_to_slot_idx(fn: Callable[[list[int]], list[int]]) -> None:
     global _installed_block_id_to_slot_idx
     _installed_block_id_to_slot_idx = fn
 
 
-def install_resolve_and_lease(
-    fn: Callable[["RemoteKvReusePlan"], "RemoteG2ResolveResult"]
-) -> None:
+def install_resolve_and_lease(fn: Callable[["RemoteKvReusePlan"], "RemoteG2ResolveResult"]) -> None:
     global _installed_resolve_and_lease
     _installed_resolve_and_lease = fn
 
@@ -145,18 +139,14 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         *,
         plan_store: Optional[TargetRemotePlanStore] = None,
         binding_store: Optional[TargetRemoteG2BindingStore] = None,
-        resolve_and_lease: Optional[
-            Callable[[RemoteKvReusePlan], RemoteG2ResolveResult]
-        ] = None,
+        resolve_and_lease: Optional[Callable[[RemoteKvReusePlan], RemoteG2ResolveResult]] = None,
         release_lease: Optional[Callable[[str, str], bool]] = None,
         observability: Optional[RemoteG2ObservabilitySink] = None,
     ) -> None:
         super().__init__(llm_args)
         _assert_partial_reuse_disabled(llm_args)
         self._observability = observability or NullRemoteG2ObservabilitySink()
-        self._plan_store = (
-            plan_store if plan_store is not None else target_remote_g2_plan_store()
-        )
+        self._plan_store = plan_store if plan_store is not None else target_remote_g2_plan_store()
         self._explicit_resolve_and_lease = resolve_and_lease
         self._binding_store = (
             binding_store
@@ -184,6 +174,7 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         resolver = self._resolve_and_lease
         import logging as _logging
         import os as _os
+
         _logging.warning(
             "PROBE rpc_chain get_num_new_matched_tokens pid=%d req_id=%s "
             "plan_found=%s resolver_set=%s store_id=%d",
@@ -208,6 +199,7 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
 
     def update_state_after_alloc(self, request: Any, block_ids: list[int]) -> None:
         import logging as _logging
+
         record_before = self._binding_store.get(request.request_id)
         self._binding_store.bind_target_blocks(request.request_id, block_ids)
         record_after = self._binding_store.get(request.request_id)
@@ -222,9 +214,7 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
             getattr(record_after, "is_transfer_ready", False) if record_after else False,
         )
 
-    def build_connector_meta(
-        self, scheduler_output: SchedulerOutput
-    ) -> RemoteG2ConnectorMetadata:
+    def build_connector_meta(self, scheduler_output: SchedulerOutput) -> RemoteG2ConnectorMetadata:
         # The official contract is to filter records by what's in
         # scheduler_output. Empirically that input arrives with the
         # newly-allocated request missing during the same tick the
@@ -237,14 +227,17 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         bindings: list[RemoteG2BindingRecord] = []
         states_snapshot = []
         for request_id, record in self._binding_store.iter_records():
-            states_snapshot.append((
-                request_id,
-                getattr(record, "state", None),
-                bool(record.is_transfer_ready),
-            ))
+            states_snapshot.append(
+                (
+                    request_id,
+                    getattr(record, "state", None),
+                    bool(record.is_transfer_ready),
+                )
+            )
             if record.is_transfer_ready:
                 bindings.append(record)
         import logging as _logging
+
         _logging.warning(
             "PROBE rpc_chain build_connector_meta scanned=%d transfer_ready=%d states=%s "
             "scheduler_output_size=%d",
@@ -330,6 +323,7 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
     def start_load_kv(self, stream: Any) -> None:
         metadata = self.get_connector_meta()
         import logging as _logging
+
         _logging.warning(
             "PROBE rpc_chain start_load_kv has_meta=%s bindings_count=%d "
             "transfer_adapter=%s mark_local_valid=%s publish_binding=%s",
@@ -521,14 +515,10 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
     def _release_record_once(self, record: RemoteG2BindingRecord, reason: str) -> bool:
         lease_id = record.lease_id
         if lease_id is None:
-            self._emit_record_event(
-                "released", record, reason=reason, outcome="no_lease"
-            )
+            self._emit_record_event("released", record, reason=reason, outcome="no_lease")
             return False
         if lease_id in self._released_leases:
-            self._emit_record_event(
-                "released", record, reason=reason, outcome="already_released"
-            )
+            self._emit_record_event("released", record, reason=reason, outcome="already_released")
             return False
         self._released_leases.add(lease_id)
         completed = self._release_lease(lease_id, reason)

@@ -114,9 +114,7 @@ class RemoteKvReusePlan:
         kv_block_hashes_raw = data.get("kv_block_hashes", ())
         kv_block_hashes = tuple(int(h) for h in kv_block_hashes_raw)
         if kv_block_hashes and len(kv_block_hashes) != len(block_hashes):
-            raise ValueError(
-                "kv_block_hashes length must match block_hashes when provided"
-            )
+            raise ValueError("kv_block_hashes length must match block_hashes when provided")
         planned_prefix_blocks = int(data["planned_prefix_blocks"])
         if planned_prefix_blocks < 0:
             raise ValueError("planned_prefix_blocks must be non-negative")
@@ -190,9 +188,7 @@ class TargetRemotePlanStore:
             return None
         try:
             parsed = (
-                plan
-                if isinstance(plan, RemoteKvReusePlan)
-                else RemoteKvReusePlan.from_dict(plan)
+                plan if isinstance(plan, RemoteKvReusePlan) else RemoteKvReusePlan.from_dict(plan)
             )
         except (TypeError, ValueError):
             return None
@@ -200,6 +196,7 @@ class TargetRemotePlanStore:
         # new kv_block_hashes field from the wire. Investigation-only.
         import logging as _logging
         import os as _os
+
         _logging.warning(
             "PROBE rpc_chain put_plan pid=%d trtllm_req_id=%s plan_id=%s "
             "source=%s/%s target=%s/%s block_hashes_count=%d "
@@ -255,9 +252,7 @@ class TargetRemotePlanStore:
             entry = self._plans[key]
             entry.resolved = result
 
-    def get_resolution(
-        self, trtllm_request_id: int | str
-    ) -> Optional["RemoteG2ResolveResult"]:
+    def get_resolution(self, trtllm_request_id: int | str) -> Optional["RemoteG2ResolveResult"]:
         key = _normalize_request_id(trtllm_request_id)
         with self._lock:
             entry = self._plans.get(key)
@@ -455,9 +450,7 @@ def compute_remote_g2_matched_tokens(
     if computed_blocks < plan.start_block_index:
         return 0
 
-    resolved_tokens = min(
-        max(result.num_tokens, 0), len(result.descriptors) * block_size_tokens
-    )
+    resolved_tokens = min(max(result.num_tokens, 0), len(result.descriptors) * block_size_tokens)
     resolved_blocks = resolved_tokens // block_size_tokens
     plan_end = plan.start_block_index + resolved_blocks
     # B already has every position the plan covers → nothing to transfer.
@@ -498,9 +491,7 @@ class TargetRemoteG2BindingStore:
 
         try:
             parsed = (
-                plan
-                if isinstance(plan, RemoteKvReusePlan)
-                else RemoteKvReusePlan.from_dict(plan)
+                plan if isinstance(plan, RemoteKvReusePlan) else RemoteKvReusePlan.from_dict(plan)
             )
         except (TypeError, ValueError):
             return None
@@ -511,9 +502,7 @@ class TargetRemoteG2BindingStore:
         )
         planned_tokens = parsed.planned_prefix_blocks * parsed.block_size_tokens
         if matched_tokens == 0:
-            reason = self._zero_match_release_reason(
-                num_computed_tokens, parsed.block_size_tokens
-            )
+            reason = self._zero_match_release_reason(num_computed_tokens, parsed.block_size_tokens)
             if planned_tokens > 0:
                 self._emit_event(
                     "truncated",
@@ -614,11 +603,7 @@ class TargetRemoteG2BindingStore:
             source_descriptors = record.resolve_result.descriptors[skip:source_end]
             target_end = computed_blocks + matched_blocks
 
-            if (
-                skip < 0
-                or len(block_ids) < target_end
-                or len(source_descriptors) != matched_blocks
-            ):
+            if skip < 0 or len(block_ids) < target_end or len(source_descriptors) != matched_blocks:
                 self._emit_record_event(
                     "fallback",
                     record,
@@ -646,6 +631,7 @@ class TargetRemoteG2BindingStore:
             target_block_ids_list = [int(b) for b in target_block_ids]
             if target_block_ids_list:
                 from .remote_g2_connector import _installed_block_id_to_slot_idx
+
                 if _installed_block_id_to_slot_idx is not None:
                     try:
                         target_slot_indices = list(
@@ -728,9 +714,7 @@ class TargetRemoteG2BindingStore:
         state: RemoteG2BindingState,
     ) -> bool:
         if record.release_attempted:
-            self._emit_record_event(
-                "released", record, reason=reason, outcome="already_released"
-            )
+            self._emit_record_event("released", record, reason=reason, outcome="already_released")
             return False
 
         record.release_attempted = True
@@ -738,9 +722,7 @@ class TargetRemoteG2BindingStore:
         record.state = state
         lease_id = record.lease_id
         if lease_id is None:
-            self._emit_record_event(
-                "released", record, reason=reason, outcome="no_lease"
-            )
+            self._emit_record_event("released", record, reason=reason, outcome="no_lease")
             return False
 
         record.release_completed = self._release_lease(lease_id, reason)
@@ -770,21 +752,15 @@ class TargetRemoteG2BindingStore:
                     request_id=request_id,
                     plan_id=plan.plan_id if plan is not None else None,
                     lease_id=result.lease_id,
-                    source_worker_id=(
-                        plan.source_worker_id if plan is not None else None
-                    ),
+                    source_worker_id=(plan.source_worker_id if plan is not None else None),
                     source_generation=result.source_generation,
                     block_count=len(result.descriptors),
-                    byte_count=sum(
-                        descriptor.byte_length for descriptor in result.descriptors
-                    ),
+                    byte_count=sum(descriptor.byte_length for descriptor in result.descriptors),
                     token_count=result.num_tokens,
                 )
             )
 
-    def _zero_match_release_reason(
-        self, num_computed_tokens: int, block_size_tokens: int
-    ) -> str:
+    def _zero_match_release_reason(self, num_computed_tokens: int, block_size_tokens: int) -> str:
         if (
             block_size_tokens > 0
             and num_computed_tokens >= 0
@@ -825,9 +801,7 @@ class TargetRemoteG2BindingStore:
                 source_worker_id=plan.source_worker_id,
                 source_generation=result.source_generation,
                 block_count=count,
-                byte_count=sum(
-                    descriptor.byte_length for descriptor in result.descriptors
-                ),
+                byte_count=sum(descriptor.byte_length for descriptor in result.descriptors),
                 token_count=token_count,
             )
         )
@@ -852,13 +826,8 @@ class TargetRemoteG2BindingStore:
                 source_worker_id=record.plan.source_worker_id,
                 source_generation=record.source_generation,
                 block_count=len(record.bound_blocks) or len(record.resolve_result.descriptors),
-                byte_count=sum(
-                    block.source_descriptor.byte_length for block in record.bound_blocks
-                )
-                or sum(
-                    descriptor.byte_length
-                    for descriptor in record.resolve_result.descriptors
-                ),
+                byte_count=sum(block.source_descriptor.byte_length for block in record.bound_blocks)
+                or sum(descriptor.byte_length for descriptor in record.resolve_result.descriptors),
                 token_count=record.matched_tokens,
             )
         )
@@ -926,35 +895,23 @@ class SourceG2DescriptorRegistry:
         now_ms = self._clock_ms()
         try:
             parsed = (
-                plan
-                if isinstance(plan, RemoteKvReusePlan)
-                else RemoteKvReusePlan.from_dict(plan)
+                plan if isinstance(plan, RemoteKvReusePlan) else RemoteKvReusePlan.from_dict(plan)
             )
         except (TypeError, ValueError):
-            return RemoteG2ResolveResult(
-                None, (), 0, "invalid_plan", self.source_generation
-            )
+            return RemoteG2ResolveResult(None, (), 0, "invalid_plan", self.source_generation)
 
         if parsed.plan_version != REMOTE_KV_REUSE_PLAN_VERSION:
             return RemoteG2ResolveResult(
                 None, (), 0, "unsupported_plan_version", self.source_generation
             )
         if parsed.source_worker_id != self.source_worker_id:
-            return RemoteG2ResolveResult(
-                None, (), 0, "wrong_source_worker", self.source_generation
-            )
+            return RemoteG2ResolveResult(None, (), 0, "wrong_source_worker", self.source_generation)
         if parsed.source_dp_rank != self.source_dp_rank:
-            return RemoteG2ResolveResult(
-                None, (), 0, "wrong_source_rank", self.source_generation
-            )
+            return RemoteG2ResolveResult(None, (), 0, "wrong_source_rank", self.source_generation)
         if not parsed.is_remote_g2():
-            return RemoteG2ResolveResult(
-                None, (), 0, "wrong_source_tier", self.source_generation
-            )
+            return RemoteG2ResolveResult(None, (), 0, "wrong_source_tier", self.source_generation)
         if parsed.is_expired(now_ms):
-            return RemoteG2ResolveResult(
-                None, (), 0, "plan_expired", self.source_generation
-            )
+            return RemoteG2ResolveResult(None, (), 0, "plan_expired", self.source_generation)
         if self._require_trtllm_pin and self._acquire_pin is None:
             return RemoteG2ResolveResult(
                 None, (), 0, "missing_trtllm_pin_hook", self.source_generation
@@ -978,9 +935,7 @@ class SourceG2DescriptorRegistry:
                 if record is None and self._kv is not None:
                     lookup_results = self._find_and_pin_blocks_by_hash(kv_hashes[i:])
                     if not lookup_results:
-                        per_block_status.append(
-                            RemoteG2BlockStatus(int(identity_hash), "missing")
-                        )
+                        per_block_status.append(RemoteG2BlockStatus(int(identity_hash), "missing"))
                         break
                     for offset, lookup_result in enumerate(lookup_results):
                         current_identity_hash = int(identity_hashes[i + offset])
@@ -1025,9 +980,7 @@ class SourceG2DescriptorRegistry:
                     break
                 records.append(record)
                 per_block_status.append(
-                    RemoteG2BlockStatus(
-                        int(identity_hash), "live", record.descriptor_generation
-                    )
+                    RemoteG2BlockStatus(int(identity_hash), "live", record.descriptor_generation)
                 )
                 i += 1
 
@@ -1171,9 +1124,7 @@ class SourceG2DescriptorRegistry:
                 )
         return results
 
-    def _record_from_pinned_cache_block(
-        self, pinned: PinnedCacheBlock
-    ) -> SourceG2DescriptorRecord:
+    def _record_from_pinned_cache_block(self, pinned: PinnedCacheBlock) -> SourceG2DescriptorRecord:
         byte_offset = int(pinned.slot_idx) * self._block_size_bytes
         record = SourceG2DescriptorRecord(
             block_hash=pinned.block_hash,
