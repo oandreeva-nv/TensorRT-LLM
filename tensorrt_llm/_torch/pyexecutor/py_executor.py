@@ -2780,9 +2780,25 @@ class PyExecutor:
 
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
-            reqs_to_terminate = self.kv_connector_manager.get_finished()
-            for req in reqs_to_terminate:
+            poll_result = self.kv_connector_manager.get_finished()
+            for req in poll_result.finished_saving:
                 self._end_transfer_and_maybe_terminate(req)
+            if poll_result.failed_loading:
+                for req in poll_result.failed_loading:
+                    self._kv_connector_disable_reuse_store(req)
+                self._handle_errors("KV cache load failure",
+                                    requests=poll_result.failed_loading,
+                                    charge_budget=False)
+
+    def _kv_connector_disable_reuse_store(self, request: LlmRequest):
+        """Prevent a failed connector load's never-validated blocks from being
+        stored for reuse (they hold garbage, not the matched prefix's KV)."""
+        try:
+            request.context_current_position = 0
+        except Exception:
+            logger.exception(
+                "remote_g2: failed to reset context position for request %s",
+                getattr(request, "py_request_id", None))
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -5043,15 +5059,18 @@ class PyExecutor:
         """Check if a request can be canceled and attempt cancellation if needed.
 
         Returns:
-            bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
+            bool: True when connector and applicable transceiver cleanup are
+                both complete.
         """
-        if self.kv_cache_transceiver is None:
-            return True
+        connector_done = (self.kv_connector_manager is None
+                          or self.kv_connector_manager.request_abort(
+                              request.request_id, "cancelled"))
+        transceiver_done = True
+        if (self.kv_cache_transceiver is not None
+                and self._is_request_in_transmission(request)):
+            transceiver_done = self.kv_cache_transceiver.cancel_request(request)
 
-        if not self._is_request_in_transmission(request):
-            return True
-
-        return self.kv_cache_transceiver.cancel_request(request)
+        return connector_done and transceiver_done
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):

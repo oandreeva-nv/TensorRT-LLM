@@ -12,16 +12,141 @@ to PyExecutor, including:
 
 import threading
 import time
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import KvCacheConnectorPollResult
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, ScheduledRequests
+
+
+def test_kv_connector_poll_terminates_saves_and_fails_only_failed_loads():
+    executor = object.__new__(PyExecutor)
+    finished_save = MagicMock()
+    failed_load = MagicMock()
+    unrelated = MagicMock()
+    executor.active_requests = [failed_load, unrelated]
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.get_finished.return_value = KvCacheConnectorPollResult(
+        finished_saving=[finished_save], failed_loading=[failed_load]
+    )
+    executor._end_transfer_and_maybe_terminate = MagicMock()
+    executor._error_budget = MagicMock()
+    executor._fatal_error = None
+    executor.is_shutdown = False
+    executor._enqueue_responses = MagicMock()
+    termination_positions = []
+    executor._terminate_request = MagicMock(
+        side_effect=lambda request: termination_positions.append(
+            request.context_current_position))
+    failed_load.py_request_id = 42
+    failed_load.py_client_id = 7
+    failed_load.context_current_position = 128
+    unrelated.py_request_id = 43
+    unrelated.py_client_id = 8
+
+    executor._kv_connector_terminate_requests()
+
+    executor._end_transfer_and_maybe_terminate.assert_called_once_with(finished_save)
+    executor._error_budget.consume.assert_not_called()
+    assert executor.is_shutdown is False
+    assert executor._fatal_error is None
+    assert executor.active_requests == [unrelated]
+    assert failed_load.state == LlmRequestState.GENERATION_COMPLETE
+    assert failed_load.context_current_position == 0
+    assert termination_positions == [0]
+    executor._terminate_request.assert_called_once_with(failed_load)
+    responses = executor._enqueue_responses.call_args.args[0]
+    assert len(responses) == 1
+    assert responses[0][0] == 42
+    assert responses[0][1].error_msg == "KV cache load failure"
+
+
+@pytest.mark.parametrize(
+    "connector_result,transceiver_result,expected",
+    [
+        (False, False, False),
+        (False, True, False),
+        (True, False, False),
+        (True, True, True),
+    ],
+)
+def test_try_cancel_request_requires_connector_and_transceiver_cleanup(
+    connector_result, transceiver_result, expected
+):
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.request_abort.return_value = connector_result
+    executor.kv_cache_transceiver = MagicMock()
+    executor.kv_cache_transceiver.cancel_request.return_value = transceiver_result
+    request = MagicMock()
+    request.request_id = 17
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+    assert executor._try_cancel_request(request) is expected
+
+    executor.kv_connector_manager.request_abort.assert_called_once_with(17, "cancelled")
+    executor.kv_cache_transceiver.cancel_request.assert_called_once_with(request)
+
+
+@pytest.mark.parametrize("connector_result", [False, True])
+def test_try_cancel_request_returns_connector_result_without_transceiver(
+    connector_result,
+):
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.request_abort.return_value = connector_result
+    executor.kv_cache_transceiver = None
+    request = MagicMock()
+    request.request_id = 23
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+    assert executor._try_cancel_request(request) is connector_result
+
+    executor.kv_connector_manager.request_abort.assert_called_once_with(23, "cancelled")
+
+
+def test_handle_canceled_requests_retains_id_until_all_cleanup_finishes():
+    executor = object.__new__(PyExecutor)
+    executor.canceled_req_ids = [29]
+    executor.waiting_queue = MagicMock()
+    executor.kv_connector_manager = MagicMock()
+    executor.kv_connector_manager.request_abort.side_effect = [False, True, True]
+    executor.kv_cache_transceiver = MagicMock()
+    executor.kv_cache_transceiver.cancel_request.side_effect = [True, False, True]
+    request = MagicMock()
+    request.request_id = 31
+    request.py_request_id = 29
+    request.is_child = False
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    executor.active_requests = [request]
+
+    executor._handle_canceled_requests()
+
+    assert executor.canceled_req_ids == [29]
+    request.finish_by_reason.assert_not_called()
+
+    executor._handle_canceled_requests()
+
+    assert executor.canceled_req_ids == [29]
+    request.finish_by_reason.assert_not_called()
+
+    executor._handle_canceled_requests()
+
+    assert executor.canceled_req_ids == []
+    assert executor.kv_connector_manager.request_abort.call_args_list == [
+        ((31, "cancelled"),),
+        ((31, "cancelled"),),
+        ((31, "cancelled"),),
+    ]
+    assert executor.kv_cache_transceiver.cancel_request.call_count == 3
+    request.finish_by_reason.assert_called_once()
 
 
 class MockPyExecutor:
@@ -573,7 +698,8 @@ def test_prepare_resources_and_check_forward_ready_releases_skipped_inflight_id(
     executor.resource_manager.prepare_resources.side_effect = prepare_resources
 
     can_queue, can_queue_this_rank = PyExecutor._prepare_resources_and_check_forward_ready(
-        executor, scheduled_batch)
+        executor, scheduled_batch
+    )
 
     assert can_queue is False
     assert can_queue_this_rank is False
@@ -593,7 +719,8 @@ def test_prepare_resources_and_check_forward_ready_keeps_admitted_batch_forward_
     scheduled_batch.append_generation_request(generation_request)
 
     can_queue, can_queue_this_rank = PyExecutor._prepare_resources_and_check_forward_ready(
-        executor, scheduled_batch)
+        executor, scheduled_batch
+    )
 
     assert can_queue is True
     assert can_queue_this_rank is True
@@ -630,8 +757,9 @@ def test_kv_connector_manager_rejects_attention_dp_when_required():
     executor.enable_attention_dp = True
     executor.kv_connector_manager.requires_disable_attention_dp = True
 
-    with pytest.raises(NotImplementedError,
-                       match="attention data parallelism|enable_attention_dp=False"):
+    with pytest.raises(
+        NotImplementedError, match="attention data parallelism|enable_attention_dp=False"
+    ):
         PyExecutor._maybe_init_kv_connector_manager(executor)
 
 
@@ -655,15 +783,16 @@ def test_kv_connector_manager_allows_host_kv_cache_when_supported():
     executor.kv_connector_manager.wait_for_initialization.assert_called_once()
 
 
-@pytest.mark.parametrize("is_vswa,is_linear_attention", [(True, False),
-                                                         (False, True)])
+@pytest.mark.parametrize("is_vswa,is_linear_attention", [(True, False), (False, True)])
 def test_kv_connector_manager_rejects_non_uniform_attention_window_when_required(
-        is_vswa, is_linear_attention):
+    is_vswa, is_linear_attention
+):
     executor = _make_executor_for_kv_connector_init()
     executor.kv_cache_manager.is_vswa = is_vswa
     executor.kv_cache_manager.is_linear_attention = is_linear_attention
     executor.kv_connector_manager.requires_uniform_attention_window = True
 
-    with pytest.raises(NotImplementedError,
-                       match="variable sliding-window|single non-linear attention window"):
+    with pytest.raises(
+        NotImplementedError, match="variable sliding-window|single non-linear attention window"
+    ):
         PyExecutor._maybe_init_kv_connector_manager(executor)

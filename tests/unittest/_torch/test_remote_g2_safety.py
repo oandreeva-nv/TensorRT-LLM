@@ -8,36 +8,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 _ROOT = Path(__file__).resolve().parents[3]
 _CONNECTOR_PACKAGE = "tensorrt_llm._torch.pyexecutor.connectors"
-_REMOTE_G2_PATH = (
-    _ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "connectors" / "remote_g2.py"
-)
+_REMOTE_G2_PATH = _ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "connectors" / "remote_g2.py"
 _REMOTE_G2_CONNECTOR_PATH = (
-    _ROOT
-    / "tensorrt_llm"
-    / "_torch"
-    / "pyexecutor"
-    / "connectors"
-    / "remote_g2_connector.py"
+    _ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "connectors" / "remote_g2_connector.py"
 )
 _REMOTE_G2_TRANSFER_PATH = (
-    _ROOT
-    / "tensorrt_llm"
-    / "_torch"
-    / "pyexecutor"
-    / "connectors"
-    / "remote_g2_transfer.py"
+    _ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "connectors" / "remote_g2_transfer.py"
 )
 _REMOTE_G2_OBSERVABILITY_PATH = (
-    _ROOT
-    / "tensorrt_llm"
-    / "_torch"
-    / "pyexecutor"
-    / "connectors"
-    / "remote_g2_observability.py"
+    _ROOT / "tensorrt_llm" / "_torch" / "pyexecutor" / "connectors" / "remote_g2_observability.py"
 )
 
 ROADMAP_FAILURE_SET = {
@@ -104,12 +85,8 @@ def _load_connector_modules():
         _REMOTE_G2_OBSERVABILITY_PATH,
     )
     remote_g2 = _load_module(f"{_CONNECTOR_PACKAGE}.remote_g2", _REMOTE_G2_PATH)
-    transfer = _load_module(
-        f"{_CONNECTOR_PACKAGE}.remote_g2_transfer", _REMOTE_G2_TRANSFER_PATH
-    )
-    connector = _load_module(
-        f"{_CONNECTOR_PACKAGE}.remote_g2_connector", _REMOTE_G2_CONNECTOR_PATH
-    )
+    transfer = _load_module(f"{_CONNECTOR_PACKAGE}.remote_g2_transfer", _REMOTE_G2_TRANSFER_PATH)
+    connector = _load_module(f"{_CONNECTOR_PACKAGE}.remote_g2_connector", _REMOTE_G2_CONNECTOR_PATH)
     return observability, remote_g2, transfer, connector
 
 
@@ -149,17 +126,29 @@ class _FakeTransferResult:
         self.completed = completed
         self.fail = fail
         self.released = 0
+        self.initial_state = (
+            TRANSFER.RemoteG2TransferState.SUCCEEDED
+            if completed and not fail
+            else TRANSFER.RemoteG2TransferState.IN_PROGRESS
+        )
 
-    def is_completed(self):
+    def poll_state(self):
         if self.fail:
             raise RuntimeError("transfer failed")
-        return self.completed
+        return (
+            TRANSFER.RemoteG2TransferState.SUCCEEDED
+            if self.completed
+            else TRANSFER.RemoteG2TransferState.IN_PROGRESS
+        )
 
-    def release(self):
+    def quiesce(self):
         self.released += 1
+        return True
 
 
 class _FakeTransferAdapter:
+    supports_synchronous_release = True
+
     def __init__(self, result_factory=None):
         self.started = []
         self.result_factory = result_factory
@@ -331,9 +320,7 @@ def test_remote_g2_decision_equivalence_for_representative_prefixes():
         observability=sink,
     )
 
-    for index, (name, hashes, num_tokens, computed, expected, release_reason) in enumerate(
-        cases
-    ):
+    for index, (name, hashes, num_tokens, computed, expected, release_reason) in enumerate(cases):
         result = _resolve_result(
             block_hashes=hashes,
             num_tokens=num_tokens,
@@ -342,7 +329,13 @@ def test_remote_g2_decision_equivalence_for_representative_prefixes():
 
         # D-06/D-07/D-08/D-09: local validation asserts decision equivalence.
         assert (
-            compute_remote_g2_matched_tokens(RemoteKvReusePlan.from_dict(_plan(plan_id=f"plan-{name}")), result, computed, 16) == expected
+            compute_remote_g2_matched_tokens(
+                RemoteKvReusePlan.from_dict(_plan(plan_id=f"plan-{name}")),
+                result,
+                computed,
+                16,
+            )
+            == expected
         ), name
         record = store.resolve_for_request(
             1000 + index,
@@ -394,9 +387,7 @@ def test_compute_matched_handles_partial_overlap_with_target_prefix():
             planned_prefix_blocks=3,
         )
     )
-    result = _resolve_result(
-        block_hashes=(44, 55, 66), num_tokens=48, lease_id="lease-overlap"
-    )
+    result = _resolve_result(block_hashes=(44, 55, 66), num_tokens=48, lease_id="lease-overlap")
     assert compute_remote_g2_matched_tokens(plan, result, 5 * 16, 16) == 2 * 16
 
 
@@ -410,9 +401,7 @@ def test_compute_matched_returns_zero_when_b_prefix_past_plan_end():
             planned_prefix_blocks=3,
         )
     )
-    result = _resolve_result(
-        block_hashes=(44, 55, 66), num_tokens=48, lease_id="lease-past"
-    )
+    result = _resolve_result(block_hashes=(44, 55, 66), num_tokens=48, lease_id="lease-past")
     assert compute_remote_g2_matched_tokens(plan, result, 8 * 16, 16) == 0
 
 
@@ -446,12 +435,9 @@ def test_remote_g2_fault_injection_covers_roadmap_failure_set():
     )
 
     adapter = _FakeTransferAdapter()
-    released = []
     worker = CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
         transfer_adapter=adapter,
-        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
-        or True,
         mark_local_valid=lambda record: None,
         publish_binding=lambda record: None,
         observability=sink,
@@ -462,20 +448,13 @@ def test_remote_g2_fault_injection_covers_roadmap_failure_set():
     worker.start_load_kv(None)
     assert adapter.started == [record]
     assert worker.get_finished([], [1234]) == ([], [1234])
-    # Fix 1 (deferred release): release is deferred until allgather.
-    assert released == []
-    worker.on_globally_finished_loading({1234})
-    assert released == [("lease-bound", "transfer_succeeded")]
 
 
 def test_remote_g2_duplicate_callbacks_do_not_double_transfer_or_release():
     adapter = _FakeTransferAdapter()
-    released = []
     worker = CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
         transfer_adapter=adapter,
-        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
-        or True,
         mark_local_valid=lambda record: None,
         publish_binding=lambda record: None,
     )
@@ -487,10 +466,6 @@ def test_remote_g2_duplicate_callbacks_do_not_double_transfer_or_release():
     assert adapter.started == [record]
     assert worker.get_finished([], [1234]) == ([], [1234])
     assert worker.get_finished([], [1234]) == ([], [])
-    # Fix 1 (deferred release): release is deferred until allgather.
-    assert released == []
-    worker.on_globally_finished_loading({1234})
-    assert released == [("lease-bound", "transfer_succeeded")]
 
 
 def test_remote_g2_target_cancellation_releases_once_and_publishes_nothing():
@@ -530,18 +505,12 @@ def test_remote_g2_allocation_failure_releases_once_and_publishes_nothing():
 
 
 def test_remote_g2_transfer_failure_and_timeout_release_once():
-    failure_released = []
-
     def failing_result(record):
         return _FakeTransferResult(record, completed=False, fail=True)
 
     failure_worker = CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
         transfer_adapter=_FakeTransferAdapter(failing_result),
-        release_lease=lambda lease_id, reason: failure_released.append(
-            (lease_id, reason)
-        )
-        or True,
         mark_local_valid=lambda record: None,
         publish_binding=lambda record: None,
     )
@@ -550,20 +519,14 @@ def test_remote_g2_transfer_failure_and_timeout_release_once():
     )
     failure_worker.start_load_kv(None)
 
-    with pytest.raises(RuntimeError, match="failed closed"):
-        failure_worker.get_finished([], [1234])
-    assert failure_released == [("lease-failed", "transfer_failed")]
+    assert failure_worker.get_finished([], [1234]) == ([], [])
+    assert failure_worker.take_failed_load_request_ids() == {1234}
 
-    timeout_released = []
     timeout_worker = CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
         transfer_adapter=_FakeTransferAdapter(
             lambda record: _FakeTransferResult(record, completed=False)
         ),
-        release_lease=lambda lease_id, reason: timeout_released.append(
-            (lease_id, reason)
-        )
-        or True,
         mark_local_valid=lambda record: None,
         publish_binding=lambda record: None,
         transfer_timeout_ms=-1,
@@ -573,15 +536,13 @@ def test_remote_g2_transfer_failure_and_timeout_release_once():
     )
     timeout_worker.start_load_kv(None)
 
-    with pytest.raises(RuntimeError, match="timed out"):
-        timeout_worker.get_finished([], [1234])
-    assert timeout_released == [("lease-timeout", "transfer_timeout")]
+    assert timeout_worker.get_finished([], [1234]) == ([], [])
+    assert timeout_worker.take_failed_load_request_ids() == {1234}
 
 
-def test_remote_g2_source_restart_metadata_mismatch_cleans_up_without_publication():
+def test_remote_g2_legacy_adapter_is_rejected_without_starting_transfer():
     agent = _FakeAgent()
     sink = InMemoryRemoteG2ObservabilitySink()
-    released = []
     marked_valid = []
     published = []
     adapter = RemoteG2NixlTransferAdapter(
@@ -595,8 +556,6 @@ def test_remote_g2_source_restart_metadata_mismatch_cleans_up_without_publicatio
     worker = CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
         transfer_adapter=adapter,
-        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
-        or True,
         mark_local_valid=marked_valid.append,
         publish_binding=published.append,
         observability=sink,
@@ -605,41 +564,63 @@ def test_remote_g2_source_restart_metadata_mismatch_cleans_up_without_publicatio
         RemoteG2ConnectorMetadata(bindings=(_bound_record(lease_id="lease-restart"),))
     )
 
-    with pytest.raises(RuntimeError, match="failed to start"):
-        worker.start_load_kv(None)
+    worker.start_load_kv(None)
+    worker.get_finished([], [1234])
 
     assert agent.requests == []
     assert marked_valid == []
     assert published == []
-    assert released == [("lease-restart", "transfer_start_failed")]
     names = _event_names(sink)
-    assert "fallback" in names
-    assert "released" in names
+    assert "failed" in names
+    assert "released" not in names
     assert "transferred" not in names
 
 
-def test_remote_g2_lease_release_is_exactly_once_per_attempt():
-    released = []
+def test_remote_g2_capable_adapter_metadata_mismatch_is_a_request_failure():
+    agent = _FakeAgent()
+    adapter = RemoteG2NixlTransferAdapter(
+        source_metadata_fetcher=lambda worker_id, generation: _source_metadata(
+            worker_id, generation + 1
+        ),
+        target_descriptor_resolver=_target_descriptors,
+        agent_factory=lambda: agent,
+        transfer_types=_FAKE_TRANSFER_TYPES,
+    )
+    # Exercise the pre-handle metadata/start failure path independently of
+    # the production legacy-adapter capability rejection.
+    adapter.supports_synchronous_release = True
     worker = CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
-        transfer_adapter=_FakeTransferAdapter(),
-        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
-        or True,
+        transfer_adapter=adapter,
         mark_local_valid=lambda record: None,
         publish_binding=lambda record: None,
     )
+    worker.bind_connector_meta(
+        RemoteG2ConnectorMetadata(bindings=(_bound_record(lease_id="lease-mismatch"),))
+    )
+
+    worker.start_load_kv(None)
+
+    assert worker.take_failed_load_request_ids() == {1234}
+    assert worker.get_finished([], [1234]) == ([], [])
+    assert agent.requests == []
+
+
+def test_remote_g2_handle_release_is_exactly_once_per_attempt():
     record = _bound_record(lease_id="lease-exact-once")
+    result = _FakeTransferResult(record)
+    worker = CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(lambda record: result),
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
     worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(record,)))
     worker.start_load_kv(None)
 
     assert worker.get_finished([], [1234]) == ([], [1234])
-    # Fix 1 (deferred release): release is deferred until allgather.
-    assert released == []
-    worker.on_globally_finished_loading({1234})
-    assert released == [("lease-exact-once", "transfer_succeeded")]
-    # Duplicate call must not produce a second release.
-    worker._release_record_once(record, "duplicate_after_success")
-    assert released == [("lease-exact-once", "transfer_succeeded")]
+    assert worker.abort_request(1234) is True
+    assert result.released == 1
 
 
 def test_remote_g2_observability_contract_covers_required_events_without_raw_addresses():
@@ -667,7 +648,6 @@ def test_remote_g2_observability_contract_covers_required_events_without_raw_add
     success_worker = CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
         transfer_adapter=_FakeTransferAdapter(),
-        release_lease=lambda lease_id, reason: True,
         mark_local_valid=lambda record: None,
         publish_binding=lambda record: None,
         observability=sink,
@@ -681,19 +661,15 @@ def test_remote_g2_observability_contract_covers_required_events_without_raw_add
     failed_worker = CONNECTOR.RemoteG2KvCacheConnectorWorker(
         None,
         transfer_adapter=_FakeTransferAdapter(),
-        release_lease=lambda lease_id, reason: True,
         mark_local_valid=lambda record: None,
-        publish_binding=lambda record: (_ for _ in ()).throw(
-            RuntimeError("publish failed")
-        ),
+        publish_binding=lambda record: (_ for _ in ()).throw(RuntimeError("publish failed")),
         observability=sink,
     )
     failed_worker.bind_connector_meta(
         RemoteG2ConnectorMetadata(bindings=(_bound_record(lease_id="lease-failed"),))
     )
     failed_worker.start_load_kv(None)
-    with pytest.raises(RuntimeError, match="failed closed"):
-        failed_worker.get_finished([], [1234])
+    assert failed_worker.get_finished([], [1234]) == ([], [])
 
     assert {
         "planned",

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -12,6 +13,36 @@ from .remote_g2 import RemoteG2BindingRecord, RemoteG2Descriptor
 
 class RemoteG2TransferError(RuntimeError):
     pass
+
+
+class RemoteG2TransferContractError(RemoteG2TransferError):
+    """A transfer result cannot prove that its handle is safe to release."""
+
+    def __init__(self, message: str, transfer_result: Any) -> None:
+        super().__init__(message)
+        self.transfer_result = transfer_result
+
+
+class RemoteG2TransferState(Enum):
+    IN_PROGRESS = "in_progress"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+def validate_remote_g2_transfer_result(result: Any) -> Any:
+    """Fail closed while retaining ownership of a possibly-live result."""
+    missing = []
+    if not isinstance(getattr(result, "initial_state", None), RemoteG2TransferState):
+        missing.append("initial_state")
+    for method_name in ("poll_state", "quiesce"):
+        if not callable(getattr(result, method_name, None)):
+            missing.append(method_name)
+    if missing:
+        raise RemoteG2TransferContractError(
+            "remote G2 transfer result lacks retryable cleanup contract: " + ", ".join(missing),
+            result,
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -140,6 +171,8 @@ class RemoteG2SourceMetadataCache:
 
 
 class RemoteG2NixlTransferAdapter:
+    supports_synchronous_release = False
+
     def __init__(
         self,
         *,
@@ -213,9 +246,7 @@ class RemoteG2NixlTransferAdapter:
             TransferOp,
             TransferRequest,
         )
-        from tensorrt_llm._torch.disaggregation.nixl.agent import (  # noqa: PLC0415
-            NixlTransferAgent,
-        )
+        from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent  # noqa: PLC0415
 
         self._transfer_types = SimpleNamespace(
             MemoryDescs=MemoryDescs,

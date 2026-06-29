@@ -201,6 +201,14 @@ class KvCacheConnectorWorker(ABC):
         longer than others to complete the operations.
         """
 
+    def take_failed_load_request_ids(self) -> set[int]:
+        """Drain request IDs whose asynchronous KV loads failed."""
+        return set()
+
+    def abort_request(self, request_id: int) -> bool:
+        """Return whether connector-owned resources are fully cleaned."""
+        return True
+
 
 class KvCacheConnectorScheduler(ABC):
     requires_retryable_kv_admission = False
@@ -274,6 +282,14 @@ class KvCacheConnectorScheduler(ABC):
         """
         return
 
+    def abort_request(self, request_id: int, reason: str) -> bool:
+        """Return whether scheduler-side connector state is fully cleaned."""
+        return True
+
+    def finish_load(self, request_id: int) -> bool:
+        """Return whether scheduler state for a successful load is cleaned."""
+        return True
+
 
 # An internal dataclass to handle async saving/loading requests.
 @dataclass
@@ -310,6 +326,12 @@ class AsyncRequests:
 
         return new_async_requests
 
+    def discard_request_id(self, request_id: int) -> Optional[LlmRequest]:
+        """Discard an asynchronous request if it is currently tracked."""
+        request = self.loading.pop(request_id, None)
+        saving_request = self.saving.pop(request_id, None)
+        return request if request is not None else saving_request
+
     @property
     def saving_ids(self) -> Set[int]:
         """
@@ -323,6 +345,22 @@ class AsyncRequests:
         Get the IDs of the requests that are being loaded asynchronously.
         """
         return set(self.loading.keys())
+
+
+@dataclass
+class KvCacheConnectorPollResult:
+    """Request-scoped results from one connector progress poll."""
+
+    finished_saving: List[LlmRequest] = field(default_factory=list)
+    failed_loading: List[LlmRequest] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _ConnectorFatalError:
+    """A picklable, sanitized worker-hook error shared by every rank."""
+
+    exception_type: str
+    message: str
 
 
 class KvCacheConnectorSchedulerOutputRequest:
@@ -423,6 +461,11 @@ class KvCacheConnectorSchedulerOutputManager:
     def record_new_matched_tokens(self, request: LlmRequest, num_new_matched_tokens: int):
         self.external_loads[request.request_id] = num_new_matched_tokens
 
+    def discard_request_id(self, request_id: int) -> None:
+        """Discard all scheduler-output state for a request."""
+        self.requests.pop(request_id, None)
+        self.external_loads.pop(request_id, None)
+
 
 class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     """
@@ -460,6 +503,17 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         # Requests that have finished loading asynchronously.
         self.finished_async_loading_requests = dict()
+
+        # Abort coordination is deliberately request-ID based. Connector block
+        # IDs are rank-local and therefore must never cross the TP collective.
+        self._local_abort_intents: Dict[int, str] = {}
+        self._global_abort_intents: Dict[int, str] = {}
+        self._local_quiescent: Set[int] = set()
+        self._all_ranks_quiescent: Set[int] = set()
+        self._local_data_cleaned: Set[int] = set()
+        self._scheduler_cleanup_acks: Set[int] = set()
+        self._scheduler_success_acks: Set[int] = set()
+        self._abort_requests: Dict[int, LlmRequest] = {}
 
         self._scheduler_output = None
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
@@ -617,7 +671,230 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         return saving_async
 
-    def get_finished(self) -> List[LlmRequest]:
+    def _find_tracked_request(self, request_id: int) -> Optional[LlmRequest]:
+        for requests in (
+            self.new_async_requests,
+            self.pending_async_requests,
+            self.local_finished_async_requests,
+        ):
+            request = requests.loading.get(request_id)
+            if request is None:
+                request = requests.saving.get(request_id)
+            if request is not None:
+                return request
+        request = self.finished_async_loading_requests.get(request_id)
+        if request is not None:
+            return request
+        return self._abort_requests.get(request_id)
+
+    @staticmethod
+    def _merge_abort_reason(current: Optional[str], incoming: str) -> str:
+        # A concrete transfer failure must not be downgraded to cancellation.
+        if current == "transfer_failed" or incoming == "transfer_failed":
+            return "transfer_failed"
+        return current or incoming
+
+    def _record_abort_intent(self, request_id: int, reason: str) -> bool:
+        request = self._find_tracked_request(request_id)
+        if request is None:
+            return False
+        self._abort_requests.setdefault(request_id, request)
+        self._local_abort_intents[request_id] = self._merge_abort_reason(
+            self._local_abort_intents.get(request_id), reason
+        )
+        return True
+
+    def request_abort(self, request_id: int, reason: str) -> bool:
+        """Queue a noncollective request abort.
+
+        Returning ``False`` asks the caller to retry until TP consensus has
+        drained all connector-owned state. An untracked request is already
+        quiescent and therefore returns ``True`` immediately.
+        """
+        if not self._record_abort_intent(request_id, reason):
+            return True
+        return False
+
+    def _tracked_ids(self) -> Set[int]:
+        return set().union(
+            self.new_async_requests.loading_ids,
+            self.new_async_requests.saving_ids,
+            self.pending_async_requests.loading_ids,
+            self.pending_async_requests.saving_ids,
+            self.local_finished_async_requests.loading_ids,
+            self.local_finished_async_requests.saving_ids,
+            self.finished_async_loading_requests.keys(),
+            self._abort_requests.keys(),
+        )
+
+    def _filter_request_ids(self, values: object) -> Set[int]:
+        """Return valid, currently tracked integer request IDs."""
+        if isinstance(values, (str, bytes)):
+            return set()
+        try:
+            candidates = list(values)  # type: ignore[arg-type]
+        except Exception:
+            return set()
+        tracked_ids = self._tracked_ids()
+        return {
+            request_id
+            for request_id in candidates
+            if type(request_id) is int and request_id in tracked_ids
+        }
+
+    @staticmethod
+    def _fatal_error(error: Exception) -> _ConnectorFatalError:
+        return _ConnectorFatalError(type(error).__name__, str(error))
+
+    def _discard_request_data(self, request_id: int) -> None:
+        """Idempotently discard non-coordination state for a request.
+
+        Scheduler output is transient and may contain connector-provided or
+        test-injected malformed entries. Such entries cannot safely be
+        associated with a future request, so discard them. Other unexpected
+        exceptions are retried before the next collective while canonical and
+        coordination state remains intact.
+        """
+        if self._scheduler_output is not None:
+
+            def keep_request_data(data: object) -> bool:
+                try:
+                    return data.request_id != request_id  # type: ignore[attr-defined]
+                except Exception:
+                    return False
+
+            try:
+                new_requests = list(self._scheduler_output.new_requests)
+                cached_requests = list(self._scheduler_output.cached_requests)
+            except Exception:
+                # A corrupt transient output cannot be reused safely. Clearing
+                # it is preferable to retaining a request whose cleanup has
+                # already reached cross-rank consensus.
+                self._scheduler_output = None
+            else:
+                try:
+                    self._scheduler_output.new_requests = [
+                        data for data in new_requests if keep_request_data(data)
+                    ]
+                    self._scheduler_output.cached_requests = [
+                        data for data in cached_requests if keep_request_data(data)
+                    ]
+                except Exception:
+                    self._scheduler_output = None
+
+        try:
+            self.scheduler_output_manager.discard_request_id(request_id)
+        except Exception:
+            # The concrete manager uses ordinary dictionaries, but retain an
+            # infallible fallback so finalization cannot escape the executor
+            # loop if instrumentation or a connector replaces the helper.
+            try:
+                self.scheduler_output_manager.requests.pop(request_id, None)
+                self.scheduler_output_manager.external_loads.pop(request_id, None)
+            except Exception:
+                # The concrete stores are ordinary dictionaries; this guard is
+                # solely to keep post-collective finalization non-throwing.
+                pass
+
+        for requests in (
+            self.new_async_requests,
+            self.pending_async_requests,
+            self.local_finished_async_requests,
+        ):
+            requests.discard_request_id(request_id)
+        self.finished_async_loading_requests.pop(request_id, None)
+
+    def _finalize_request_id(self, request_id: int) -> Optional[LlmRequest]:
+        """Remove coordination only after every rank cleaned request data."""
+        request = self._abort_requests.pop(request_id, None)
+        self._local_abort_intents.pop(request_id, None)
+        self._global_abort_intents.pop(request_id, None)
+        self._local_quiescent.discard(request_id)
+        self._all_ranks_quiescent.discard(request_id)
+        self._local_data_cleaned.discard(request_id)
+        self._scheduler_cleanup_acks.discard(request_id)
+        self._scheduler_success_acks.discard(request_id)
+        return request
+
+    def _record_local_poll_progress(
+        self,
+        finished_saving: object,
+        finished_loading: object,
+        failed_loading: object,
+    ) -> None:
+        """Fold this rank's worker poll results into local bookkeeping.
+
+        Runs on the path to the TP collective, so it is intentionally free of
+        broadcasts; the caller converts any failure here into a shared fatal.
+        """
+        finished_saving_ids = self._filter_request_ids(finished_saving)
+        finished_loading_ids = self._filter_request_ids(finished_loading)
+        failed_loading_ids = self._filter_request_ids(failed_loading)
+        for request_id in failed_loading_ids:
+            self._record_abort_intent(request_id, "transfer_failed")
+
+        # Remove the requests from our pending list that have finished locally.
+        finished_saving_ids &= self.pending_async_requests.saving_ids
+        finished_loading_ids &= self.pending_async_requests.loading_ids
+        new_local_finished_async_requests = self.pending_async_requests.extract_by_id(
+            sorted(finished_saving_ids), sorted(finished_loading_ids)
+        )
+
+        # Add these requests to our list of locally finished requests.
+        self.local_finished_async_requests.add_from(new_local_finished_async_requests)
+
+    def _drive_local_abort_cleanup(self) -> None:
+        """Complete rank-local connector and data cleanup for abort intents.
+
+        The snapshot is taken over a copy of the intent set so a concurrently
+        mutated dict cannot raise on the path to the collective.
+        """
+        for request_id in list(self._global_abort_intents):
+            if request_id in self._local_quiescent:
+                continue
+            if self.worker.abort_request(request_id) is not True:
+                raise RuntimeError(
+                    f"KV connector worker failed to release request {request_id}"
+                )
+            self._local_quiescent.add(request_id)
+
+        # Data cleanup is rank-local and idempotent. Attempt it as soon as the
+        # local worker is quiescent, but retain the canonical request and all
+        # coordination until the collective proves every rank succeeded.
+        for request_id in list(self._global_abort_intents):
+            if request_id not in self._local_quiescent:
+                continue
+            if request_id in self._local_data_cleaned:
+                continue
+            try:
+                self._discard_request_data(request_id)
+            except Exception:
+                continue
+            self._local_data_cleaned.add(request_id)
+
+    def _build_poll_payload(self, fatal_error: "Optional[_ConnectorFatalError]") -> tuple:
+        """Snapshot rank-local state into the allgather payload.
+
+        Must never raise: a payload snapshot is not allowed to be the reason a
+        rank misses the collective. On failure it returns an empty, fatal-flagged
+        payload so every rank still rendezvous and fails symmetrically.
+        """
+        is_leader = mpi_rank() == 0
+        try:
+            return (
+                sorted(self.local_finished_async_requests.saving_ids),
+                sorted(self.local_finished_async_requests.loading_ids),
+                dict(self._local_abort_intents),
+                set(self._local_quiescent),
+                set(self._scheduler_cleanup_acks) if is_leader else set(),
+                fatal_error,
+                set(self._local_data_cleaned),
+                set(self._scheduler_success_acks) if is_leader else set(),
+            )
+        except Exception as error:
+            return ([], [], {}, set(), set(), fatal_error or self._fatal_error(error), set(), set())
+
+    def get_finished(self) -> KvCacheConnectorPollResult:
         """
         Process requests that have finished loading and saving.
 
@@ -633,27 +910,123 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         # Pass these newly finished requests into get_finished, and get
         # the list of requests that have finished saving and loading.
-        (finished_saving, finished_loading) = self.worker.get_finished(
-            finished_gen_req_ids, started_loading_req_ids
+        fatal_error = None
+        try:
+            worker_result = self.worker.get_finished(finished_gen_req_ids, started_loading_req_ids)
+            finished_saving, finished_loading = worker_result
+        except Exception as error:
+            fatal_error = self._fatal_error(error)
+            finished_saving, finished_loading = (), ()
+
+        try:
+            failed_loading = self.worker.take_failed_load_request_ids()
+        except Exception as error:
+            if fatal_error is None:
+                fatal_error = self._fatal_error(error)
+            failed_loading = ()
+
+        # Everything from here to the collective mutates only rank-local
+        # bookkeeping, but it MUST NOT raise out of this method: if a single
+        # rank skipped the mpi_allgather below, the TP group would desync and
+        # every rank would hang. Convert any unexpected failure into a shared
+        # fatal that all ranks observe symmetrically *after* the collective.
+        try:
+            self._record_local_poll_progress(finished_saving, finished_loading, failed_loading)
+            self._drive_local_abort_cleanup()
+        except Exception as error:
+            if fatal_error is None:
+                fatal_error = self._fatal_error(error)
+
+        payload = self._build_poll_payload(fatal_error)
+        all_results = mpi_allgather(payload)
+
+        fatal_errors = [
+            (rank, result[5])
+            for rank, result in enumerate(all_results)
+            if isinstance(result[5], _ConnectorFatalError)
+        ]
+        if fatal_errors:
+            _, shared_error = min(fatal_errors, key=lambda item: item[0])
+            raise RuntimeError(
+                f"KV connector worker hook failed: "
+                f"{shared_error.exception_type}: {shared_error.message}"
+            )
+
+        # Merge request-ID intents deterministically. A transfer failure wins
+        # over cancellation irrespective of rank order.
+        for result in all_results:
+            intents = result[2]
+            if not isinstance(intents, dict):
+                continue
+            for request_id, reason in intents.items():
+                if type(request_id) is not int or not isinstance(reason, str):
+                    continue
+                request = self._find_tracked_request(request_id)
+                if request is None:
+                    continue
+                self._abort_requests.setdefault(request_id, request)
+                self._global_abort_intents[request_id] = self._merge_abort_reason(
+                    self._global_abort_intents.get(request_id), reason
+                )
+                self._local_abort_intents[request_id] = self._merge_abort_reason(
+                    self._local_abort_intents.get(request_id), reason
+                )
+
+        quiescent_sets = [
+            {request_id for request_id in result[3] if type(request_id) is int}
+            if isinstance(result[3], (set, list, tuple))
+            else set()
+            for result in all_results
+        ]
+        self._all_ranks_quiescent = set.intersection(*quiescent_sets) if quiescent_sets else set()
+
+        gathered_scheduler_acks = set().union(
+            *(
+                {request_id for request_id in result[4] if type(request_id) is int}
+                if isinstance(result[4], (set, list, tuple))
+                else set()
+                for result in all_results
+            )
         )
-
-        # Remove the requests from our pending list that have finished locally.
-        new_local_finished_async_requests = self.pending_async_requests.extract_by_id(
-            finished_saving, finished_loading
+        data_cleaned_sets = [
+            {request_id for request_id in result[6] if type(request_id) is int}
+            if isinstance(result[6], (set, list, tuple))
+            else set()
+            for result in all_results
+        ]
+        all_ranks_data_cleaned = (
+            set.intersection(*data_cleaned_sets) if data_cleaned_sets else set()
         )
-
-        # Add these requests to our list of locally finished requests.
-        self.local_finished_async_requests.add_from(new_local_finished_async_requests)
-
-        # Broadcast this whole list to all other workers.
-        finished_saving = list(self.local_finished_async_requests.saving_ids)
-        finished_loading = list(self.local_finished_async_requests.loading_ids)
-
-        all_results = mpi_allgather((finished_saving, finished_loading))
+        gathered_success_acks = set().union(
+            *(
+                {request_id for request_id in result[7] if type(request_id) is int}
+                if isinstance(result[7], (set, list, tuple))
+                else set()
+                for result in all_results
+            )
+        )
 
         # Find only the requests that have been reported complete by all workers.
         intersect_finished_saving = set.intersection(*[set(res[0]) for res in all_results])
         intersect_finished_loading = set.intersection(*[set(res[1]) for res in all_results])
+        abort_ids = set(self._global_abort_intents)
+        intersect_finished_saving -= abort_ids
+        intersect_finished_loading -= abort_ids
+
+        # Successful loads also own scheduler-side lease state. Rank 0 cleans
+        # it only after every worker has reported local success, then publishes
+        # the acknowledgement through the next poll's sole collective.
+        if self.scheduler is not None:
+            for request_id in intersect_finished_loading:
+                if request_id in self._scheduler_success_acks:
+                    continue
+                try:
+                    if self.scheduler.finish_load(request_id) is True:
+                        self._scheduler_success_acks.add(request_id)
+                except Exception:
+                    pass
+
+        promoted_loading_ids = intersect_finished_loading & gathered_success_acks
 
         # Fix 1 (TP>1 release lifecycle): notify the worker that these
         # loading requests are globally confirmed — all TP ranks have
@@ -670,17 +1043,46 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         # Remove these requests from our list of locally finished requests.
         all_finished = self.local_finished_async_requests.extract_by_id(
-            intersect_finished_saving, intersect_finished_loading
+            intersect_finished_saving, promoted_loading_ids
         )
 
         # For requests that have finished loading, move them back to the context state.
         for id, req in all_finished.loading.items():
             req.state = LlmRequestState.CONTEXT_INIT
             self.finished_async_loading_requests[id] = req
+            self._scheduler_success_acks.discard(id)
+
+        # Rank 0 performs scheduler cleanup only after the current collective
+        # proves every worker quiescent. The acknowledgement is intentionally
+        # published by the next poll's single collective.
+        if self.scheduler is not None:
+            for request_id in self._all_ranks_quiescent:
+                if request_id in self._scheduler_cleanup_acks:
+                    continue
+                reason = self._global_abort_intents.get(request_id)
+                if reason is None:
+                    continue
+                try:
+                    if self.scheduler.abort_request(request_id, reason) is True:
+                        self._scheduler_cleanup_acks.add(request_id)
+                except Exception:
+                    pass
+
+        failed_requests = []
+        for request_id in sorted(gathered_scheduler_acks & all_ranks_data_cleaned):
+            reason = self._global_abort_intents.get(request_id)
+            if reason is None:
+                continue
+            request = self._finalize_request_id(request_id)
+            if reason == "transfer_failed" and request is not None:
+                failed_requests.append(request)
 
         # Return the requests that have finished saving.
         # The execution loop will call _terminate_request on these requests.
-        return list(all_finished.saving.values())
+        return KvCacheConnectorPollResult(
+            finished_saving=list(all_finished.saving.values()),
+            failed_loading=failed_requests,
+        )
 
     def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int]):
         if self.scheduler is not None:
