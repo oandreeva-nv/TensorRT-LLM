@@ -135,9 +135,7 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
     supports_host_kv_cache = True
 
     requires_retryable_kv_admission = True
-    # KVCM V1 local offload/onboard is not safe under overlap scheduler.
-    # See NVBug 6293536.
-    requires_disable_overlap_scheduler = True
+    requires_disable_overlap_scheduler = False
     requires_disable_attention_dp = True
     requires_uniform_attention_window = True
 
@@ -266,7 +264,7 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
 class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
     requires_retryable_kv_admission = True
     # Keep scheduler and worker capability flags aligned.
-    requires_disable_overlap_scheduler = True
+    requires_disable_overlap_scheduler = False
     requires_disable_attention_dp = True
     requires_uniform_attention_window = True
     supports_host_kv_cache = True
