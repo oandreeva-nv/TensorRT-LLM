@@ -1165,19 +1165,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             intersect_finished_load_request_ids & gathered_success_ack_request_ids
         )
 
-        # Fix 1 (TP>1 release lifecycle): notify the worker that these
-        # loading requests are globally confirmed — all TP ranks have
-        # finished their transfers.  The remote-G2 worker uses this
-        # hook to send the deferred release_lease RPC to the source,
-        # which is only safe once ALL target ranks are done reading.
-        # Duck-typed: only remote-G2 workers implement this method.
-        if intersect_finished_loading and hasattr(
-            self.worker, "on_globally_finished_loading"
-        ):
-            self.worker.on_globally_finished_loading(
-                intersect_finished_loading
-            )
-
         # Remove these requests from our list of locally finished requests.
         all_finished = self.local_finished_async_requests.extract_by_id(
             intersect_finished_save_request_ids, resumable_load_request_ids
