@@ -750,14 +750,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         return saving_async
 
     def _find_tracked_request(self, request_id: int) -> Optional[LlmRequest]:
-        for requests in (
+        for async_requests in (
             self.new_async_requests,
             self.pending_async_requests,
             self.local_finished_async_requests,
         ):
-            request = requests.loading.get(request_id)
+            request = async_requests.loading.get(request_id)
             if request is None:
-                request = requests.saving.get(request_id)
+                request = async_requests.saving.get(request_id)
             if request is not None:
                 return request
         request = self.finished_async_loading_requests.get(request_id)

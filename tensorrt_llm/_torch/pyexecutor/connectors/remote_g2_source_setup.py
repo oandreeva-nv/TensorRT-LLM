@@ -16,12 +16,13 @@ variables that the dynamo worker process sets before spawning the engine.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-import pickle
 import threading
 import time
 from dataclasses import dataclass
+from tempfile import gettempdir
 from typing import Any, Optional
 
 from .remote_g2 import SourceG2DescriptorRegistry
@@ -327,12 +328,14 @@ def _result_to_dict(result: Any) -> dict:
 def _ipc_socket_path(dynamo_pid: int, tp_rank: int = 0, tp_size: int = 1) -> str:
     """Return the ZMQ IPC socket path for a given TP rank.
 
-    TP=1: /tmp/dynamo_remote_g2_ipc_{pid}.sock (backward-compatible)
-    TP>1: /tmp/dynamo_remote_g2_ipc_{pid}_tp{rank}.sock (per-rank)
+    TP=1 uses ``dynamo_remote_g2_ipc_{pid}.sock`` for backward compatibility.
+    TP>1 uses ``dynamo_remote_g2_ipc_{pid}_tp{rank}.sock`` per rank.
+    The wire format is JSON-encoded request/response dictionaries.
     """
     if tp_size <= 1:
-        return f"/tmp/dynamo_remote_g2_ipc_{dynamo_pid}.sock"
-    return f"/tmp/dynamo_remote_g2_ipc_{dynamo_pid}_tp{tp_rank}.sock"
+        return os.path.join(gettempdir(), f"dynamo_remote_g2_ipc_{dynamo_pid}.sock")
+    return os.path.join(gettempdir(), f"dynamo_remote_g2_ipc_{dynamo_pid}_tp{tp_rank}.sock")
+
 
 
 def _query_sibling_rank(
@@ -357,15 +360,15 @@ def _query_sibling_rank(
     req.SNDTIMEO = 5000
     try:
         req.connect(f"ipc://{sibling_path}")
-        req.send(pickle.dumps({
+        req.send(json.dumps({
             "method": "resolve_hashes",
             "payload": {
                 "block_hashes": block_hashes,
                 "lease_id": lease_id,
             },
-        }))
+        }).encode("utf-8"))
         raw = req.recv()
-        resp = pickle.loads(raw)
+        resp = json.loads(raw.decode("utf-8"))
         if resp.get("ok"):
             return resp.get("result", [])
         logging.warning(
@@ -407,18 +410,18 @@ def _release_sibling_hashes(
         if lease_id:
             # Fix 2: lease-scoped release — sibling looks up pins by
             # lease_id instead of iterating block hashes.
-            req.send(pickle.dumps({
+            req.send(json.dumps({
                 "method": "release_lease_pins",
                 "payload": {"lease_id": lease_id},
-            }))
+            }).encode("utf-8"))
         else:
             # Legacy path: release by block hashes.
-            req.send(pickle.dumps({
+            req.send(json.dumps({
                 "method": "release_hashes",
                 "payload": {"block_hashes": block_hashes},
-            }))
+            }).encode("utf-8"))
         raw = req.recv()
-        resp = pickle.loads(raw)
+        resp = json.loads(raw.decode("utf-8"))
         if resp.get("ok"):
             return resp.get("result", 0)
         logging.warning(
@@ -482,7 +485,7 @@ def _start_zmq_rep_service(
                 logging.exception("remote_g2: ZMQ REP recv failed; exiting loop")
                 return
             try:
-                req = pickle.loads(raw)
+                req = json.loads(raw.decode("utf-8"))
                 method = req.get("method")
                 payload = req.get("payload") or {}
                 if method == "resolve_hashes":
@@ -862,7 +865,7 @@ def _start_zmq_rep_service(
                             result_dict["per_rank_descriptors"] = None
                             response = {
                                 "ok": True, "result": result_dict}
-                            rep.send(pickle.dumps(response))
+                            rep.send(json.dumps(response).encode("utf-8"))
                             continue
 
                         result_dict["per_rank_descriptors"] = per_rank_descs
@@ -1005,7 +1008,7 @@ def _start_zmq_rep_service(
                 logging.exception("remote_g2: ZMQ REP handler raised")
                 response = {"ok": False, "error": repr(exc)}
             try:
-                rep.send(pickle.dumps(response))
+                rep.send(json.dumps(response).encode("utf-8"))
             except Exception:
                 logging.exception("remote_g2: ZMQ REP send failed")
 
@@ -1019,13 +1022,12 @@ def _walk_to_dynamo_worker_pid(max_depth: int = 10) -> Optional[int]:
     ancestor whose cmdline mentions 'dynamo.trtllm'. OpenMPI's orted
     strips arbitrary env vars when spawning ranks, so the engine
     subprocess can't read DYNAMO_REMOTE_G2_WORKER_ID directly; this
-    helper finds the dynamo parent so we can read a sidecar file
-    /tmp/dynamo_remote_g2_worker_<pid>.txt instead.
+    helper finds the dynamo parent so we can read a sidecar file in
+    the process temporary directory instead.
 
     When TP=1 (no MPI spawn), the engine runs inline in the dynamo
-    process itself — there is no parent to walk to. In that case we
-    check if the current process IS the dynamo process and return our
-    own PID.
+    process itself. In that case we check if the current process is the
+    dynamo process and return our own PID.
     """
     try:
         my_pid = os.getpid()
@@ -1086,7 +1088,7 @@ def _resolve_source_identity() -> Optional[tuple[int, int]]:
             pass
     if dynamo_pid is None:
         return None
-    sidecar = f"/tmp/dynamo_remote_g2_worker_{dynamo_pid}.txt"
+    sidecar = os.path.join(gettempdir(), f"dynamo_remote_g2_worker_{dynamo_pid}.txt")
     try:
         with open(sidecar) as f:
             worker_id = int(f.read().strip())
