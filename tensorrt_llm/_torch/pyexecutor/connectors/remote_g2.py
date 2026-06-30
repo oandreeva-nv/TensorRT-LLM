@@ -117,6 +117,10 @@ class RemoteKvReusePlan:
         planned_prefix_blocks = int(data["planned_prefix_blocks"])
         if planned_prefix_blocks < 0:
             raise ValueError("planned_prefix_blocks must be non-negative")
+
+        # -1 to make sure prepopulatedPromptLen < promptLen
+        planned_prefix_blocks=max(0, min(planned_prefix_blocks, len(block_hashes)) - 1)
+
         start_block_index = int(data["start_block_index"])
         if start_block_index < 0:
             raise ValueError("start_block_index must be non-negative")
@@ -132,7 +136,7 @@ class RemoteKvReusePlan:
             block_hashes=block_hashes,
             kv_block_hashes=kv_block_hashes,
             start_block_index=start_block_index,
-            planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),
+            planned_prefix_blocks=planned_prefix_blocks,
             block_size_tokens=int(data["block_size_tokens"]),
             created_at_ms=int(data["created_at_ms"]),
             expires_at_ms=int(data["expires_at_ms"]),

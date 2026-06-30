@@ -270,7 +270,7 @@ def test_source_registry_resolve_and_lease_returns_live_contiguous_prefix():
     registry.upsert_descriptor(first)
     registry.upsert_descriptor(second)
 
-    result = registry.resolve_and_lease(_plan())
+    result = registry.resolve_and_lease(_plan(block_hashes=[11, 22, 33, 44], planned_prefix_blocks=4))  # +sacrificial last block: from_dict reserves it (prepopulated<prompt)
 
     assert result.reason == "ok"
     assert result.num_tokens == 32
@@ -342,7 +342,7 @@ def test_source_registry_reports_first_missing_block_status():
         clock_ms=lambda: 1_000,
     )
 
-    result = registry.resolve_and_lease(_plan(planned_prefix_blocks=1))
+    result = registry.resolve_and_lease(_plan(planned_prefix_blocks=2))  # +1: from_dict reserves the last block
 
     assert result.reason == "no_live_remote_g2_prefix"
     assert result.per_block_status[0].block_hash == 11
@@ -396,7 +396,7 @@ def test_source_registry_falls_back_to_find_and_pin_secondary_when_kv_provided()
         tier="host_pinned",
     )
 
-    result = registry.resolve_and_lease(_plan())
+    result = registry.resolve_and_lease(_plan(block_hashes=[11, 22, 33, 44], planned_prefix_blocks=4))  # +sacrificial last block
 
     assert result.reason == "ok"
     assert result.lease_id is not None
@@ -432,7 +432,7 @@ def test_source_registry_kv_fallback_is_disabled_when_kv_is_none():
         clock_ms=lambda: 1_000,
     )
 
-    result = registry.resolve_and_lease(_plan(planned_prefix_blocks=1))
+    result = registry.resolve_and_lease(_plan(planned_prefix_blocks=2))  # +1: from_dict reserves the last block
 
     assert result.reason == "no_live_remote_g2_prefix"
     assert result.per_block_status[0].status == "missing"
@@ -492,10 +492,10 @@ def test_source_registry_uses_kv_block_hashes_for_lookup_when_present():
     # The descriptors must carry tokens hashes so the router can correlate.
     assert [d.block_hash for d in result.descriptors] == [11, 22]
     # The kv-side hashes are the ones used against kv.find_and_pin_secondary_block_by_hash.
-    assert lookups == kv_hashes
+    assert lookups == kv_hashes[:2]  # last block reserved by from_dict (-1)
     # Per-block status reports the tokens (router-side) hash.
     statuses = [(s.block_hash, s.status) for s in result.per_block_status]
-    assert statuses == [(11, "live"), (22, "live"), (33, "missing")]
+    assert statuses == [(11, "live"), (22, "live")]  # 33 reserved by from_dict (-1)
     # Slot/byte_offset derived from the FakeKv's slot returns, which are
     # bound to kv-side hashes, not tokens-side.
     assert [d.byte_offset for d in result.descriptors] == [
@@ -507,8 +507,8 @@ def test_source_registry_uses_kv_block_hashes_for_lookup_when_present():
 def test_remote_plan_parser_truncates_prefix_to_hash_count():
     parsed = RemoteKvReusePlan.from_dict(_plan(planned_prefix_blocks=10))
 
-    assert parsed.planned_prefix_blocks == 3
-    assert parsed.planned_hashes == (11, 22, 33)
+    assert parsed.planned_prefix_blocks == 2  # clamp to 3 hashes, then -1 to reserve last block
+    assert parsed.planned_hashes == (11, 22)
 
 
 def test_remote_g2_matched_tokens_use_source_resolved_block_aligned_prefix():
