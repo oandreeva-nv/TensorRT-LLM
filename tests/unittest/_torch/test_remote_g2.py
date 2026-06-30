@@ -7,6 +7,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 _CONNECTOR_PACKAGE = "tensorrt_llm._torch.pyexecutor.connectors"
 _REMOTE_G2_PATH = (
     Path(__file__).resolve().parents[3]
@@ -65,14 +67,9 @@ OBSERVABILITY, _REMOTE_G2 = _load_remote_g2_modules()
 # maybe_start_remote_g2_target_client; these tests bypass that setup, so we
 # preload a stub remote_g2_connector module in sys.modules with an identity
 # callable so the lazy import resolves and binding can proceed.
-_g2_connector_stub = types.ModuleType(
-    f"{_CONNECTOR_PACKAGE}.remote_g2_connector"
-)
+_g2_connector_stub = types.ModuleType(f"{_CONNECTOR_PACKAGE}.remote_g2_connector")
 _g2_connector_stub._installed_block_id_to_slot_idx = lambda ids: list(ids)
 sys.modules[f"{_CONNECTOR_PACKAGE}.remote_g2_connector"] = _g2_connector_stub
-
-
-import pytest
 
 
 @pytest.fixture(autouse=True)
@@ -87,6 +84,7 @@ def _identity_slot_lookup_for_lazy_import():
     module._installed_block_id_to_slot_idx = lambda ids: list(ids)
     yield
     module._installed_block_id_to_slot_idx = saved
+
 
 REMOTE_G2_REUSE_ENABLED_ENV = _REMOTE_G2.REMOTE_G2_REUSE_ENABLED_ENV
 REMOTE_KV_REUSE_PLAN_VERSION = _REMOTE_G2.REMOTE_KV_REUSE_PLAN_VERSION
@@ -296,13 +294,8 @@ def test_source_registry_fails_closed_for_wrong_source_or_tier():
     registry = SourceG2DescriptorRegistry(source_worker_id=7, source_dp_rank=0)
     registry.upsert_descriptor(_record(11))
 
-    assert (
-        registry.resolve_and_lease(_plan(source_worker_id=8)).reason
-        == "wrong_source_worker"
-    )
-    assert (
-        registry.resolve_and_lease(_plan(source_dp_rank=1)).reason == "wrong_source_rank"
-    )
+    assert registry.resolve_and_lease(_plan(source_worker_id=8)).reason == "wrong_source_worker"
+    assert registry.resolve_and_lease(_plan(source_dp_rank=1)).reason == "wrong_source_rank"
     assert registry.resolve_and_lease(_plan(source_tier="device")).reason == "wrong_source_tier"
 
 
@@ -374,7 +367,12 @@ def test_source_registry_falls_back_to_find_and_pin_blocks_when_kv_provided():
             self, block_hashes, window_size, tier="host_pinned", stop_on_miss=True
         ):
             lookups.append(
-                ([int(block_hash) for block_hash in block_hashes], int(window_size), tier, stop_on_miss)
+                (
+                    [int(block_hash) for block_hash in block_hashes],
+                    int(window_size),
+                    tier,
+                    stop_on_miss,
+                )
             )
             results = []
             for block_hash in block_hashes:
@@ -587,9 +585,7 @@ def test_source_registry_reports_promoted_primary_from_tier_aware_lookup():
 
     assert result.reason == "no_live_remote_g2_prefix"
     assert result.lease_id is None
-    assert [(s.block_hash, s.status) for s in result.per_block_status] == [
-        (11, "promoted_primary")
-    ]
+    assert [(s.block_hash, s.status) for s in result.per_block_status] == [(11, "promoted_primary")]
 
 
 def test_remote_plan_parser_truncates_prefix_to_hash_count():
@@ -733,15 +729,17 @@ def test_remote_g2_duplicate_and_reordered_callbacks_are_idempotent():
         1234,
         RemoteKvReusePlan.from_dict(_plan()),
         0,
-        lambda plan: resolve_calls.append(plan.plan_id)
-        or _resolve_result(lease_id="lease-idempotent"),
+        lambda plan: (
+            resolve_calls.append(plan.plan_id) or _resolve_result(lease_id="lease-idempotent")
+        ),
     )
     duplicate = store.resolve_for_request(
         1234,
         RemoteKvReusePlan.from_dict(_plan()),
         0,
-        lambda plan: resolve_calls.append(plan.plan_id)
-        or _resolve_result(lease_id="lease-duplicate"),
+        lambda plan: (
+            resolve_calls.append(plan.plan_id) or _resolve_result(lease_id="lease-duplicate")
+        ),
     )
 
     assert duplicate is first
@@ -783,3 +781,73 @@ def test_remote_g2_terminal_cleanup_releases_lease_once_for_all_reasons():
         assert record.state is expected_state
 
     assert released == [(f"lease-{reason}", reason) for reason, _ in cases]
+
+
+def test_remote_g2_external_worker_cleanup_forgets_binding_without_second_release():
+    released = []
+    store = TargetRemoteG2BindingStore(
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason)) or True
+    )
+    store.resolve_for_request(
+        1234,
+        RemoteKvReusePlan.from_dict(_plan()),
+        0,
+        lambda plan: _resolve_result(lease_id="lease-worker-released"),
+    )
+
+    assert store.discard_without_release(1234) is True
+    assert store.discard_without_release(1234) is True
+    assert store.get(1234) is None
+    assert released == []
+
+
+def test_remote_g2_release_and_discard_retries_exception_without_losing_record():
+    responses = [RuntimeError("transport"), True]
+    calls = []
+
+    def release(lease_id, reason):
+        calls.append((lease_id, reason))
+        response = responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    store = TargetRemoteG2BindingStore(release_lease=release)
+    record = store.resolve_for_request(
+        1234,
+        RemoteKvReusePlan.from_dict(_plan()),
+        0,
+        lambda plan: _resolve_result(lease_id="lease-retry"),
+    )
+
+    with pytest.raises(RuntimeError, match="transport"):
+        store.release_and_discard(1234, "transfer_failed")
+    assert store.get(1234) is record
+    assert record.release_attempted is False
+    assert record.release_reason is None
+    assert record.state is RemoteG2BindingState.RESOLVED
+
+    assert store.release_and_discard(1234, "transfer_failed") is True
+    assert store.release_and_discard(1234, "transfer_failed") is True
+    assert store.get(1234) is None
+    assert calls == [
+        ("lease-retry", "transfer_failed"),
+        ("lease-retry", "transfer_failed"),
+    ]
+
+
+def test_remote_g2_release_and_discard_false_is_definitive():
+    calls = []
+    store = TargetRemoteG2BindingStore(
+        release_lease=lambda lease, reason: calls.append((lease, reason)) or False
+    )
+    store.resolve_for_request(
+        1234,
+        RemoteKvReusePlan.from_dict(_plan()),
+        0,
+        lambda plan: _resolve_result(lease_id="lease-already-gone"),
+    )
+
+    assert store.release_and_discard(1234, "transfer_succeeded") is True
+    assert store.release_and_discard(1234, "transfer_succeeded") is True
+    assert calls == [("lease-already-gone", "transfer_succeeded")]

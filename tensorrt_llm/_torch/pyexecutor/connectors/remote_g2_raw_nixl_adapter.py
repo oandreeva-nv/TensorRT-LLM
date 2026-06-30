@@ -17,7 +17,23 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
+
+from .remote_g2_transfer import RemoteG2TransferState, validate_remote_g2_transfer_result
+
+
+def _classify_nixl_transfer_state(state: Any) -> RemoteG2TransferState:
+    """Normalize raw NIXL enum and string statuses, failing closed."""
+    if state is None:
+        return RemoteG2TransferState.FAILED
+
+    raw_name = getattr(state, "name", state)
+    value = str(raw_name).strip().upper().rsplit(".", 1)[-1]
+    if value in {"DONE", "SUCCESS"}:
+        return RemoteG2TransferState.SUCCEEDED
+    if value in {"PROC", "PROCESSING", "PENDING"}:
+        return RemoteG2TransferState.IN_PROGRESS
+    return RemoteG2TransferState.FAILED
 
 
 @dataclass
@@ -147,6 +163,8 @@ class RawNixlRemoteG2Adapter:
     but the fetcher returns a dict (not RemoteG2SourceMetadata) carrying
     the raw NIXL agent metadata bytes.
     """
+
+    supports_retryable_release = True
 
     def __init__(
         self,
@@ -389,6 +407,16 @@ class RawNixlRemoteG2Adapter:
             if _nvtx is not None:
                 _nvtx.range_pop()
 
+        # Take ownership before posting: transfer() can fail after NIXL has
+        # created a live handle, and cleanup must still be retryable.
+        result = _RawNixlTransferResult(
+            agent=self._agent,
+            handle=handle,
+            record=record,
+            initial_state=RemoteG2TransferState.FAILED,
+        )
+        validate_remote_g2_transfer_result(result)
+
         # Kick off the transfer. NIXL's `transfer(handle)` is the
         # post_xfer equivalent and returns the initial state. The
         # connector worker's get_finished now iterates self._active_loads
@@ -397,21 +425,22 @@ class RawNixlRemoteG2Adapter:
         if _nvtx is not None:
             _nvtx.range_push("remote_g2 nixl_post")
         try:
-            state = self._agent.transfer(handle)
+            try:
+                state = self._agent.transfer(handle)
+            except Exception as exc:
+                result.start_error = exc
+                return result
         finally:
             if _nvtx is not None:
                 _nvtx.range_pop()
+        result.initial_state = _classify_nixl_transfer_state(state)
         logging.warning(
             "PROBE remote_g2_raw_transfer_submitted request_id=%s initial_state=%s",
             record.request_id,
             state,
         )
 
-        return _RawNixlTransferResult(
-            agent=self._agent,
-            handle=handle,
-            record=record,
-        )
+        return result
 
 
 @dataclass
@@ -419,48 +448,36 @@ class _RawNixlTransferResult:
     agent: Any
     handle: Any
     record: Any
+    initial_state: RemoteG2TransferState
+    start_error: Optional[BaseException] = None
     _released: bool = False
 
-    _poll_count: int = 0
+    def poll_state(self) -> RemoteG2TransferState:
+        return _classify_nixl_transfer_state(self.agent.check_xfer_state(self.handle))
 
     def is_completed(self) -> bool:
-        state = self.agent.check_xfer_state(self.handle)
-        self._poll_count += 1
-        # Log first poll, every 100th, and any non-PROC state — keeps
-        # noise low while making completion visible.
-        state_str = str(state).upper()
-        if (
-            self._poll_count == 1
-            or self._poll_count % 100 == 0
-            or state_str not in ("PROC", "PROCESSING", "PENDING")
-        ):
-            logging.warning(
-                "PROBE remote_g2_raw_is_completed request_id=%s poll=%d state=%s",
-                getattr(self.record, "request_id", "?"),
-                self._poll_count,
-                state_str,
-            )
-        return state_str in ("DONE", "SUCCESS")
+        return self.poll_state() is RemoteG2TransferState.SUCCEEDED
 
     def wait(self, timeout_ms: Optional[int] = None) -> bool:
         import time
 
         deadline = None if timeout_ms is None else time.monotonic() + timeout_ms / 1000.0
         while True:
-            state = self.agent.check_xfer_state(self.handle)
-            if str(state).upper() in ("DONE", "SUCCESS"):
+            state = self.poll_state()
+            if state is RemoteG2TransferState.SUCCEEDED:
                 return True
-            if str(state).upper() in ("ERROR", "FAILED"):
+            if state is RemoteG2TransferState.FAILED:
                 return False
             if deadline is not None and time.monotonic() > deadline:
                 return False
             time.sleep(0.001)
 
-    def release(self) -> None:
+    def release_transfer(self) -> bool:
         if self._released:
-            return
-        try:
-            self.agent.release_xfer_handle(self.handle)
-        except Exception:
-            logging.exception("remote_g2: release_xfer_handle failed")
+            return True
+        self.agent.release_xfer_handle(self.handle)
         self._released = True
+        return True
+
+    def release(self) -> None:
+        self.release_transfer()

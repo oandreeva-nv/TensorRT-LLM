@@ -669,12 +669,31 @@ class TargetRemoteG2BindingStore:
     def discard(self, request_id: int | str, reason: str = "discarded") -> bool:
         key = _normalize_request_id(request_id)
         with self._lock:
-            record = self._records.pop(key, None)
+            record = self._records.get(key)
             if record is None:
                 return False
-            return self._release_record_once(
+            completed = self._release_record_once(
                 record, reason, self._terminal_state_for_release(reason)
             )
+            self._records.pop(key, None)
+            return completed
+
+    def release_and_discard(self, request_id: int | str, reason: str = "released") -> bool:
+        """Release definitively, then forget; retain state on RPC errors."""
+        key = _normalize_request_id(request_id)
+        with self._lock:
+            record = self._records.get(key)
+            if record is None:
+                return True
+            self._release_record_once(record, reason, self._terminal_state_for_release(reason))
+            self._records.pop(key, None)
+            return True
+
+    def discard_without_release(self, request_id: int | str) -> bool:
+        """Forget a binding whose lease was already released by workers."""
+        with self._lock:
+            self._records.pop(_normalize_request_id(request_id), None)
+        return True
 
     def get(self, request_id: int | str) -> Optional[RemoteG2BindingRecord]:
         with self._lock:
@@ -690,10 +709,9 @@ class TargetRemoteG2BindingStore:
 
     def clear(self) -> None:
         with self._lock:
-            records = tuple(self._records.values())
-            self._records.clear()
-        for record in records:
-            self._release_record_once(record, "clear", RemoteG2BindingState.RELEASED)
+            request_ids = tuple(self._records)
+        for request_id in request_ids:
+            self.release_and_discard(request_id, "clear")
 
     def __len__(self) -> int:
         with self._lock:
@@ -709,22 +727,27 @@ class TargetRemoteG2BindingStore:
             self._emit_record_event("released", record, reason=reason, outcome="already_released")
             return False
 
+        lease_id = record.lease_id
+        if lease_id is None:
+            completed = False
+            outcome = "no_lease"
+        else:
+            completed = self._release_lease(lease_id, reason)
+            if not isinstance(completed, bool):
+                raise TypeError("remote G2 lease release must return bool")
+            outcome = "completed" if completed else "already_released"
+
         record.release_attempted = True
         record.release_reason = reason
         record.state = state
-        lease_id = record.lease_id
-        if lease_id is None:
-            self._emit_record_event("released", record, reason=reason, outcome="no_lease")
-            return False
-
-        record.release_completed = self._release_lease(lease_id, reason)
+        record.release_completed = completed
         self._emit_record_event(
             "released",
             record,
             reason=reason,
-            outcome="completed" if record.release_completed else "already_released",
+            outcome=outcome,
         )
-        return record.release_completed
+        return completed
 
     def _release_positive_lease(
         self,

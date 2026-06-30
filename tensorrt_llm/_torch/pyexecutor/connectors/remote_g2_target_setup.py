@@ -10,7 +10,7 @@ This module opens a ZMQ REQ socket connecting to the parent's local REP
 loop and installs sync callables into the connector's module state so
 the scheduler picks them up at call time.
 
-Wire format mirrors the source side: pickle-encoded request/response,
+Wire format mirrors the source side: JSON-encoded request/response,
 ``{"method": ..., "payload": ...}`` ⇄ ``{"ok": bool, "result"|"error": ...}``.
 
 Note on installation order: PyExecutor constructs the connector
@@ -24,12 +24,13 @@ at call time, so installation can happen later.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import os
-import pickle
 import threading
 import time
-from typing import Any, Mapping, Optional, Sequence
+from tempfile import gettempdir
+from typing import Any, Optional, Sequence
 
 from . import remote_g2_connector
 from .remote_g2 import (
@@ -60,18 +61,36 @@ class _TargetReqWrapper:
         import zmq
 
         self._socket_path = socket_path
+        self._timeout_ms = timeout_ms
         self._ctx = zmq.Context.instance()
-        self._socket = self._ctx.socket(zmq.REQ)
-        self._socket.RCVTIMEO = timeout_ms
-        self._socket.SNDTIMEO = timeout_ms
-        self._socket.connect(f"ipc://{socket_path}")
+        self._zmq = zmq
+        self._socket = self._make_socket()
         self._lock = threading.Lock()
+
+    def _make_socket(self):
+        socket = self._ctx.socket(self._zmq.REQ)
+        socket.RCVTIMEO = self._timeout_ms
+        socket.SNDTIMEO = self._timeout_ms
+        socket.connect(f"ipc://{self._socket_path}")
+        return socket
+
+    def _reset_socket(self) -> None:
+        try:
+            self._socket.close(linger=0)
+        finally:
+            self._socket = self._make_socket()
 
     def request(self, method: str, payload: dict) -> dict:
         with self._lock:
-            self._socket.send(pickle.dumps({"method": method, "payload": payload}))
-            raw = self._socket.recv()
-        return pickle.loads(raw)
+            try:
+                self._socket.send(
+                    json.dumps({"method": method, "payload": payload}).encode("utf-8")
+                )
+                raw = self._socket.recv()
+                return json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._reset_socket()
+                raise
 
 
 def _plan_to_dict(plan: RemoteKvReusePlan) -> dict:
@@ -191,12 +210,16 @@ def _make_release_callable(wrapper: _TargetReqWrapper, default_source_worker_id:
                     "source_worker_id": int(default_source_worker_id),
                 },
             )
-        except Exception:
-            logging.exception("remote_g2: target REQ release raised")
-            return False
-        if not isinstance(response, dict) or not response.get("ok"):
-            return False
-        return bool(response.get("result"))
+        except Exception as exc:
+            raise RuntimeError("remote_g2: target REQ release raised") from exc
+        if not isinstance(response, dict):
+            raise RuntimeError("remote_g2: target REQ release returned non-dict")
+        if response.get("ok") is not True:
+            raise RuntimeError("remote_g2: target REQ release returned not-ok")
+        result = response.get("result")
+        if not isinstance(result, bool):
+            raise RuntimeError("remote_g2: target REQ release returned non-bool result")
+        return result
 
     return _release
 
@@ -339,11 +362,9 @@ def _build_listening_nixl_agent(name: str):
     can't push its memory descriptors back to the target during the
     fetchRemoteMD handshake (it hangs in the checkRemoteMD polling
     loop)."""
-    from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import (
-        BindingsNixlTransferAgent,
-    )
+    from tensorrt_llm._torch.disaggregation.nixl._agent_cpp import BindingsNixlTransferAgent
+    from tensorrt_llm.tensorrt_llm_transfer_agent_binding import BaseAgentConfig
     from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
-        BaseAgentConfig,
         NixlTransferAgent as CppNixlTransferAgent,
     )
 
@@ -522,10 +543,10 @@ def _build_cpp_transfer_types_shim():
     from types import SimpleNamespace
 
     try:
+        from tensorrt_llm.tensorrt_llm_transfer_agent_binding import MemoryDescs as CppMemoryDescs
+        from tensorrt_llm.tensorrt_llm_transfer_agent_binding import MemoryType as CppMemoryType
+        from tensorrt_llm.tensorrt_llm_transfer_agent_binding import TransferOp as CppTransferOp
         from tensorrt_llm.tensorrt_llm_transfer_agent_binding import (
-            MemoryDescs as CppMemoryDescs,
-            MemoryType as CppMemoryType,
-            TransferOp as CppTransferOp,
             TransferRequest as CppTransferRequest,
         )
     except Exception:
@@ -535,7 +556,6 @@ def _build_cpp_transfer_types_shim():
     # RegMemoryDescs stays Python — _agent_cpp.register_memory converts it
     # internally via _convert_reg_memory_descs.
     from tensorrt_llm._torch.disaggregation.base.agent import RegMemoryDescs
-
     from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 
     _STRING_TO_CPP_MEMTYPE = {
@@ -735,7 +755,7 @@ def maybe_start_remote_g2_target_client(kv: Optional[Any] = None) -> bool:
         )
         return False
 
-    socket_path = f"/tmp/dynamo_remote_g2_target_{dynamo_pid}.sock"
+    socket_path = os.path.join(gettempdir(), f"dynamo_remote_g2_target_{dynamo_pid}.sock")
     if not _wait_for_socket(socket_path):
         logging.warning(
             "remote_g2: target client skipped (parent REP socket %s never appeared)",

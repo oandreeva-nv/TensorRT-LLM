@@ -2007,6 +2007,26 @@ class TestPyCapacitySchedulerMaxUtilization:
         assert len(fitting) == 0
         assert len(paused) == 0
 
+    def test_disagg_generation_transfer_is_not_paused(self):
+        """An in-flight connector load is not eligible for preemption."""
+        kv = MockKVCacheManager(num_free_blocks=3, blocks_per_request=5)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+        transfer_request = _make_request(
+            0, state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        )
+
+        fitting, disagg, paused = scheduler.schedule_request(
+            [make_context_request(1), transfer_request]
+        )
+
+        assert fitting == []
+        assert disagg == []
+        assert transfer_request not in paused
+
 
 class TestPyCapacitySchedulerStaticBatch:
     """

@@ -770,7 +770,8 @@ class PyExecutor:
                     and not self.disable_overlap_scheduler):
                 raise NotImplementedError(
                     "The selected KV Cache Connector requires disable_overlap_scheduler=True; "
-                    "overlap scheduler retryable KV admission is not validated.")
+                    "overlap scheduler retryable KV admission is not validated."
+                )
 
             if (self.kv_connector_manager.requires_disable_attention_dp
                     and self.enable_attention_dp):
@@ -778,12 +779,13 @@ class PyExecutor:
                     "The selected KV Cache Connector requires enable_attention_dp=False; "
                     "attention-DP retryable KV admission is not validated.")
 
-            if (self.kv_connector_manager.requires_uniform_attention_window
-                    and (getattr(self.kv_cache_manager, 'is_vswa', False)
-                         or getattr(self.kv_cache_manager, 'is_linear_attention', False))):
+            if (self.kv_connector_manager.requires_uniform_attention_window and
+                (getattr(self.kv_cache_manager, 'is_vswa', False) or getattr(
+                    self.kv_cache_manager, 'is_linear_attention', False))):
                 raise NotImplementedError(
                     "The selected KV Cache Connector requires a single non-linear attention window; "
-                    "VSWA and linear-attention KV cache layouts are not validated.")
+                    "VSWA and linear-attention KV cache layouts are not validated."
+                )
 
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
             # Start the remote-G2 source-side service here, in the engine
@@ -795,25 +797,21 @@ class PyExecutor:
             # TODO production: feature-gate via connector config rather than
             # unconditionally calling here.
             try:
-                from .connectors.remote_g2_source_setup import (
-                    maybe_start_remote_g2_service,
-                )
+                from .connectors.remote_g2_source_setup import \
+                    maybe_start_remote_g2_service
                 maybe_start_remote_g2_service(self.kv_cache_manager)
             except Exception:
                 import logging
                 logging.exception(
-                    "remote_g2: service bootstrap raised; continuing"
-                )
+                    "remote_g2: service bootstrap raised; continuing")
             try:
-                from .connectors.remote_g2_target_setup import (
-                    maybe_start_remote_g2_target_client,
-                )
+                from .connectors.remote_g2_target_setup import \
+                    maybe_start_remote_g2_target_client
                 maybe_start_remote_g2_target_client(self.kv_cache_manager)
             except Exception:
                 import logging
                 logging.exception(
-                    "remote_g2: target client bootstrap raised; continuing"
-                )
+                    "remote_g2: target client bootstrap raised; continuing")
             self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.
@@ -2770,9 +2768,25 @@ class PyExecutor:
 
     def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
-            reqs_to_terminate = self.kv_connector_manager.get_finished()
-            for req in reqs_to_terminate:
+            poll_result = self.kv_connector_manager.get_finished()
+            for req in poll_result.finished_save_requests:
                 self._end_transfer_and_maybe_terminate(req)
+            if poll_result.failed_load_requests:
+                for req in poll_result.failed_load_requests:
+                    self._prevent_kv_reuse_for_request(req)
+                self._handle_errors("KV cache load failure",
+                                    requests=poll_result.failed_load_requests,
+                                    charge_budget=False)
+
+    def _prevent_kv_reuse_for_request(self, request: LlmRequest):
+        """Prevent a failed connector load's never-validated blocks from being
+        stored for reuse (they hold garbage, not the matched prefix's KV)."""
+        try:
+            request.context_current_position = 0
+        except Exception:
+            logger.exception(
+                "remote_g2: failed to reset context position for request %s",
+                getattr(request, "py_request_id", None))
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -4905,15 +4919,20 @@ class PyExecutor:
         """Check if a request can be canceled and attempt cancellation if needed.
 
         Returns:
-            bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
+            bool: True when connector and applicable transceiver cleanup are
+                both complete.
         """
-        if self.kv_cache_transceiver is None:
-            return True
+        connector_cleanup_complete = (
+            self.kv_connector_manager is None
+            or self.kv_connector_manager.try_abort_request(
+                request.request_id, "cancelled"))
+        transceiver_cleanup_complete = True
+        if (self.kv_cache_transceiver is not None
+                and self._is_request_in_transmission(request)):
+            transceiver_cleanup_complete = self.kv_cache_transceiver.cancel_request(
+                request)
 
-        if not self._is_request_in_transmission(request):
-            return True
-
-        return self.kv_cache_transceiver.cancel_request(request)
+        return connector_cleanup_complete and transceiver_cleanup_complete
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):

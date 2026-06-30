@@ -16,12 +16,13 @@ variables that the dynamo worker process sets before spawning the engine.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-import pickle
 import threading
 import time
 from dataclasses import dataclass
+from tempfile import gettempdir
 from typing import Any, Optional
 
 from .remote_g2 import SourceG2DescriptorRegistry
@@ -99,14 +100,13 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
     constructs the matching REQ client using the same path. Returns
     the socket path for logging.
 
-    Wire format: pickle-encoded {"method": <name>, "payload": <dict>}
-    request; pickle-encoded {"ok": bool, "result"|"error": <value>}
-    response. Pickle is safe here since both ends are colocated Python
-    processes on the same host.
+    Wire format: JSON-encoded {"method": <name>, "payload": <dict>}
+    request; JSON-encoded {"ok": bool, "result"|"error": <value>}
+    response.
     """
     import zmq  # imported lazily so this module stays importable on hosts without zmq
 
-    socket_path = f"/tmp/dynamo_remote_g2_ipc_{dynamo_pid}.sock"
+    socket_path = os.path.join(gettempdir(), f"dynamo_remote_g2_ipc_{dynamo_pid}.sock")
     try:
         os.unlink(socket_path)
     except FileNotFoundError:
@@ -125,7 +125,7 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
                 logging.exception("remote_g2: ZMQ REP recv failed; exiting loop")
                 return
             try:
-                req = pickle.loads(raw)
+                req = json.loads(raw.decode("utf-8"))
                 method = req.get("method")
                 payload = req.get("payload") or {}
                 if method == "resolve_and_lease":
@@ -193,7 +193,7 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
                 logging.exception("remote_g2: ZMQ REP handler raised")
                 response = {"ok": False, "error": repr(exc)}
             try:
-                rep.send(pickle.dumps(response))
+                rep.send(json.dumps(response).encode("utf-8"))
             except Exception:
                 logging.exception("remote_g2: ZMQ REP send failed")
 
@@ -207,8 +207,8 @@ def _walk_to_dynamo_worker_pid(max_depth: int = 10) -> Optional[int]:
     ancestor whose cmdline mentions 'dynamo.trtllm'. OpenMPI's orted
     strips arbitrary env vars when spawning ranks, so the engine
     subprocess can't read DYNAMO_REMOTE_G2_WORKER_ID directly; this
-    helper finds the dynamo parent so we can read a sidecar file
-    /tmp/dynamo_remote_g2_worker_<pid>.txt instead.
+    helper finds the dynamo parent so we can read a sidecar file in
+    the process temporary directory instead.
     """
     try:
         pid = os.getpid()
@@ -257,7 +257,7 @@ def _resolve_source_identity() -> Optional[tuple[int, int]]:
             pass
     if dynamo_pid is None:
         return None
-    sidecar = f"/tmp/dynamo_remote_g2_worker_{dynamo_pid}.txt"
+    sidecar = os.path.join(gettempdir(), f"dynamo_remote_g2_worker_{dynamo_pid}.txt")
     try:
         with open(sidecar) as f:
             return int(f.read().strip()), dynamo_pid
