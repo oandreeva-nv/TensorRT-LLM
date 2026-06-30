@@ -494,9 +494,9 @@ def test_acquire_pin_then_release_round_trips_through_registry():
         "source_worker_id": SOURCE_WORKER_ID,
         "source_dp_rank": SOURCE_DP_RANK,
         "source_tier": "host_pinned",
-        "block_hashes": [111, 222],
+        "block_hashes": [111, 222, 333],
         "start_block_index": 0,
-        "planned_prefix_blocks": 2,
+        "planned_prefix_blocks": 3,  # +1: from_dict reserves the last block
         "block_size_tokens": 16,
         "created_at_ms": now_ms,
         "expires_at_ms": now_ms + 60_000,
