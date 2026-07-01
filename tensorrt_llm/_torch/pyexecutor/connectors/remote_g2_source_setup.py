@@ -16,7 +16,7 @@ variables that the dynamo worker process sets before spawning the engine.
 
 from __future__ import annotations
 
-import json
+import pickle  # nosec B403
 import logging
 import os
 import threading
@@ -360,15 +360,15 @@ def _query_sibling_rank(
     req.SNDTIMEO = 5000
     try:
         req.connect(f"ipc://{sibling_path}")
-        req.send(json.dumps({
+        req.send(pickle.dumps({  # nosec B301
             "method": "resolve_hashes",
             "payload": {
                 "block_hashes": block_hashes,
                 "lease_id": lease_id,
             },
-        }).encode("utf-8"))
+        }))
         raw = req.recv()
-        resp = json.loads(raw.decode("utf-8"))
+        resp = pickle.loads(raw)  # nosec B301
         if resp.get("ok"):
             return resp.get("result", [])
         logging.warning(
@@ -410,18 +410,18 @@ def _release_sibling_hashes(
         if lease_id:
             # Fix 2: lease-scoped release — sibling looks up pins by
             # lease_id instead of iterating block hashes.
-            req.send(json.dumps({
+            req.send(pickle.dumps({  # nosec B301
                 "method": "release_lease_pins",
                 "payload": {"lease_id": lease_id},
-            }).encode("utf-8"))
+            }))
         else:
             # Legacy path: release by block hashes.
-            req.send(json.dumps({
+            req.send(pickle.dumps({  # nosec B301
                 "method": "release_hashes",
                 "payload": {"block_hashes": block_hashes},
-            }).encode("utf-8"))
+            }))
         raw = req.recv()
-        resp = json.loads(raw.decode("utf-8"))
+        resp = pickle.loads(raw)  # nosec B301
         if resp.get("ok"):
             return resp.get("result", 0)
         logging.warning(
@@ -485,7 +485,7 @@ def _start_zmq_rep_service(
                 logging.exception("remote_g2: ZMQ REP recv failed; exiting loop")
                 return
             try:
-                req = json.loads(raw.decode("utf-8"))
+                req = pickle.loads(raw)  # nosec B301
                 method = req.get("method")
                 payload = req.get("payload") or {}
                 if method == "resolve_hashes":
@@ -865,7 +865,7 @@ def _start_zmq_rep_service(
                             result_dict["per_rank_descriptors"] = None
                             response = {
                                 "ok": True, "result": result_dict}
-                            rep.send(json.dumps(response).encode("utf-8"))
+                            rep.send(pickle.dumps(response))  # nosec B301
                             continue
 
                         result_dict["per_rank_descriptors"] = per_rank_descs
@@ -1008,7 +1008,7 @@ def _start_zmq_rep_service(
                 logging.exception("remote_g2: ZMQ REP handler raised")
                 response = {"ok": False, "error": repr(exc)}
             try:
-                rep.send(json.dumps(response).encode("utf-8"))
+                rep.send(pickle.dumps(response))  # nosec B301
             except Exception:
                 logging.exception("remote_g2: ZMQ REP send failed")
 

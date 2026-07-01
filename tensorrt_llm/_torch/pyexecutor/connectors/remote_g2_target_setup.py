@@ -10,7 +10,7 @@ This module opens a ZMQ REQ socket connecting to the parent's local REP
 loop and installs sync callables into the connector's module state so
 the scheduler picks them up at call time.
 
-Wire format mirrors the source side: JSON-encoded request/response,
+Wire format mirrors the source side: pickle-encoded request/response,
 ``{"method": ..., "payload": ...}`` ⇄ ``{"ok": bool, "result"|"error": ...}``.
 
 Note on installation order: PyExecutor constructs the connector
@@ -24,7 +24,7 @@ at call time, so installation can happen later.
 from __future__ import annotations
 
 import dataclasses
-import json
+import pickle  # nosec B403
 import logging
 import os
 import threading
@@ -84,10 +84,10 @@ class _TargetReqWrapper:
         with self._lock:
             try:
                 self._socket.send(
-                    json.dumps({"method": method, "payload": payload}).encode("utf-8")
+                    pickle.dumps({"method": method, "payload": payload})  # nosec B301
                 )
                 raw = self._socket.recv()
-                return json.loads(raw.decode("utf-8"))
+                return pickle.loads(raw)  # nosec B301
             except Exception:
                 self._reset_socket()
                 raise

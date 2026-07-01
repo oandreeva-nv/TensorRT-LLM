@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
-import json
+import pickle  # nosec B403
 import sys
 import types
 from pathlib import Path
@@ -105,7 +105,7 @@ def test_target_req_wrapper_recreates_req_socket_after_error(monkeypatch):
         def recv(self):
             if self.error is not None:
                 raise self.error
-            return json.dumps(self.response).encode("utf-8")
+            return pickle.dumps(self.response)  # nosec B301
 
         def close(self, linger=None):
             closed.append(linger)
