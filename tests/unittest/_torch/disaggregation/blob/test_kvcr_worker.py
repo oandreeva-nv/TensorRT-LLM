@@ -3,7 +3,6 @@
 """Executor-facing queue and cached KVCR operation state."""
 
 import gc
-import sys
 import threading
 import time
 import weakref
@@ -88,6 +87,22 @@ def _until(predicate):
     pytest.fail("worker state did not change within 3 seconds")
 
 
+def _stub_sdk(monkeypatch, create):
+    def initialize(self, *args, **kwargs):
+        self._runtime = create(*args, **kwargs)
+
+    monkeypatch.setattr(_KvcrWorker, "_initialize_runtime", initialize)
+    monkeypatch.setattr(_KvcrWorker, "_sdk_put", lambda self, rows: self._runtime.put(rows))
+    monkeypatch.setattr(
+        _KvcrWorker, "_sdk_get", lambda self, rows, hint=None: self._runtime.get(rows)
+    )
+    monkeypatch.setattr(_KvcrWorker, "_poll_completed", lambda self: self._runtime.progress())
+    monkeypatch.setattr(
+        _KvcrWorker, "_blocks_reuse", lambda self, spans: self._runtime.blocks_reuse(spans)
+    )
+    monkeypatch.setattr(_KvcrWorker, "_close_runtime", lambda self: self._runtime.close())
+
+
 @pytest.fixture
 def worker(monkeypatch):
     created = []
@@ -97,9 +112,7 @@ def worker(monkeypatch):
         created.append(io)
         return io
 
-    monkeypatch.setattr(
-        sys.modules["tensorrt_llm._torch.disaggregation.blob.kvcr_worker"], "_KvcrLocalIO", open_io
-    )
+    _stub_sdk(monkeypatch, open_io)
     result = _KvcrWorker(
         RegionSpec(1024, 136, RegionLayout(64, 2)),
         Span(4096, 256),
@@ -299,11 +312,7 @@ def test_mixed_batch_results_follow_row_order(worker):
 
 
 def test_worker_retains_cache_owner_until_teardown(monkeypatch):
-    monkeypatch.setattr(
-        sys.modules["tensorrt_llm._torch.disaggregation.blob.kvcr_worker"],
-        "_KvcrLocalIO",
-        _ControlledIO,
-    )
+    _stub_sdk(monkeypatch, _ControlledIO)
 
     class CacheOwner:
         pass

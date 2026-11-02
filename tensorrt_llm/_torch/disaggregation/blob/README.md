@@ -69,17 +69,13 @@ events before any lease can be returned. No KVCR API change is required by this
 helper. Its CPU tests are covered by the existing disaggregation directory test
 selectors; executor activation remains separate work.
 
-`kvcr_local_io.py` adds the owner-thread local I/O primitive: it opens KVCR with
-one host region of whole-object slots and a separate caller-owned DRAM cache,
-translates `RowBatch` keys and addresses to `deposit`/`deliver` requests, and
-processes the existing resilience callback before returning SDK completions.
-It calls KVCR directly and is not a `StoreDriver`.
-Keep both allocations alive until close succeeds, including after startup failure.
-
-`kvcr_worker.py` owns this primitive on one background thread. Submissions queue
-the batch without iterating rows or calling KVCR; queries read cached row results
-and access state. SDK calls and change callbacks run outside the state lock. The
-worker polls while idle so late resilience events are processed without a new
+`kvcr_worker.py` owns KVCR directly on one background thread. It registers one
+host region of whole-object slots, configures the separate KVCR DRAM cache,
+and translates `RowBatch` keys and addresses into `deposit`/`deliver` requests.
+Submissions queue the batch without iterating rows or calling KVCR; queries read
+cached row results and access state. SDK calls and change callbacks run outside
+the state lock. The worker processes resilience events before publishing results
+and polls while idle so late events are processed without a new
 submission. Successful operations end access after completion and once no tracked
 hazard overlaps their memory. Failed operations conservatively retain memory until
 successful SDK teardown; a failed teardown keeps access protected and can be retried.
@@ -161,7 +157,7 @@ against real KVCR. Run with a compatible KVCR installation (currently NIXL 1.5.0
 
 ```bash
 TRTLLM_TEST_KVCR_NATIVE=1 python -m pytest -m cpu_only \
-  tests/unittest/_torch/disaggregation/blob/test_kvcr_local_io.py \
+  tests/unittest/_torch/disaggregation/blob/test_kvcr_worker_sdk.py \
   tests/unittest/_torch/disaggregation/blob/test_kvcr_worker.py \
   tests/unittest/_torch/disaggregation/blob/test_kvcr_driver.py
 ```
