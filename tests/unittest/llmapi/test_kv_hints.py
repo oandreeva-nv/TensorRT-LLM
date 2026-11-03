@@ -12,6 +12,7 @@ from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import msgspec
 import pytest
 from pydantic import JsonValue, ValidationError
 
@@ -21,6 +22,71 @@ from tensorrt_llm.kv_hints.protocol import MAX_KV_HINTS_BYTES, admit_kv_hints, s
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("with_extensions", [False, True])
+def test_snapshot_msgspec_preserves_wire_fields(with_extensions: bool) -> None:
+    wire = _wire()
+    wire["actions"][0]["payload"]["block_hashes"] = [0, (1 << 64) - 1]
+    if with_extensions:
+        for name in ("producer_metadata", "x-extension", "__class__", "_extra_0", ""):
+            wire[name] = {"trace": ["router-a", None, True, 7.5]}
+            wire["actions"][0][name] = {"future": [1, "value"]}
+        wire["actions"][1]["action_only"] = False
+    snapshot = snapshot_kv_hints(wire)
+    assert snapshot is not None
+
+    envelope = snapshot.to_msgspec()
+
+    assert isinstance(envelope, msgspec.Struct)
+    assert all(isinstance(action, msgspec.Struct) for action in envelope.actions)
+    assert envelope.protocol_version == "0.1"
+    assert envelope.actions[0].action_type == "kv.fetch"
+    assert envelope.actions[0].payload["block_hashes"] == [0, (1 << 64) - 1]
+    assert msgspec.json.decode(msgspec.json.encode(envelope)) == wire
+    assert msgspec.msgpack.decode(msgspec.msgpack.encode(envelope)) == wire
+
+
+def test_snapshot_msgspec_returns_independent_nested_values() -> None:
+    wire = _wire()
+    snapshot = snapshot_kv_hints(wire)
+    assert snapshot is not None
+    original = snapshot.wire_json
+    first = snapshot.to_msgspec()
+    second = snapshot.to_msgspec()
+
+    first.actions[0].payload["block_hashes"].append(999)
+    first.actions[1].payload["nested"]["enabled"] = False
+    first.actions.reverse()
+    wire["actions"].clear()
+
+    assert snapshot.wire_json == original
+    assert msgspec.to_builtins(second) == _wire()
+    assert msgspec.to_builtins(snapshot.to_msgspec()) == _wire()
+    assert snapshot.envelope().model_dump(mode="json") == _wire()
+    with pytest.raises(AttributeError):
+        second.message_id = "changed"
+
+
+def test_snapshot_msgspec_does_not_rebuild_pydantic_models() -> None:
+    snapshot = snapshot_kv_hints(_wire())
+    assert snapshot is not None
+    with (
+        patch.object(
+            KvHintsEnvelope, "model_validate_json", side_effect=AssertionError("revalidated")
+        ),
+        patch.object(KvHintsEnvelope, "model_dump", side_effect=AssertionError("dumped")),
+    ):
+        envelope = snapshot.to_msgspec()
+    assert msgspec.to_builtins(envelope) == _wire()
+
+
+def test_snapshot_msgspec_preserves_empty_action_list() -> None:
+    wire = _wire()
+    wire["actions"] = []
+    snapshot = snapshot_kv_hints(wire)
+    assert snapshot is not None
+    assert msgspec.to_builtins(snapshot.to_msgspec()) == wire
 
 
 class _StubModelConfig:

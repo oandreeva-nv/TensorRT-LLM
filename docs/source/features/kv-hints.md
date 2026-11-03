@@ -126,6 +126,23 @@ ranks and on child requests. `LlmRequest.py_kv_hints` holds the snapshot; decodi
 returns an independent copy. Unknown action types/versions and optional JSON
 metadata remain intact.
 
+Consumers that accept `msgspec.Struct` can use `snapshot.to_msgspec()` instead
+of rebuilding Pydantic models and calling `model_dump()`:
+
+```python
+consumer.submit_hint(snapshot.to_msgspec(), request_id)
+```
+
+The returned envelope and each action are msgspec structs. Known envelope and
+action fields are available as attributes; payload dictionaries stay opaque.
+Unknown envelope and action fields retain their original names in JSON and
+MessagePack serialization, including names that are not Python identifiers.
+They are not added as consumer-facing attributes. Each call decodes fresh nested
+values, so consumer mutation cannot change the snapshot or another consumer's
+copy. Struct layouts are cached with a bounded cache; payload values are not
+cached. This accessor converts already admitted metadata and does not perform
+provider validation, authorize endpoints or execute actions.
+
 HTTP request text representations omit `kv_hints`, including when a request is
 formatted in an error log. JSON serialization and proxy forwarding retain the
 metadata. Explicitly logging a serialized request or the hints themselves still
