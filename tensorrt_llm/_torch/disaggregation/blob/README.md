@@ -55,6 +55,127 @@ All of it is CPU-only. The files, top down:
 
 ## Writing a driver
 
+For KVCR, `kvcr_lifecycle.py` provides an owner-thread tracker for the existing
+`KVCRBindings.on_resilience_event` callback. A driver supplies a resolver from
+framework `MemoryRef` values to validated, registered physical memory ranges.
+The tracker quarantines ranges named by `uncertain` events and removes only the
+matching access on `quiesced`; overlapping accesses remain protected. The KVCR
+SDK is imported only when the callback handles an event.
+
+This helper is not a complete KVCR driver or access-end proof. A driver must also
+establish ordinary completion, enforce event-before-result ordering, stop its own
+accesses, publish state to nonblocking queries, and fence failures or malformed
+events before any lease can be returned. No KVCR API change is required by this
+helper. Its CPU tests are covered by the existing disaggregation directory test
+selectors; executor activation remains separate work.
+
+`kvcr_worker.py` owns KVCR directly on one background thread. It registers one
+host region of whole-object slots, configures the separate KVCR DRAM cache,
+and translates `RowBatch` keys and addresses into `deposit`/`deliver` requests.
+Submissions queue the batch without iterating rows or calling KVCR; queries read
+cached row results and access state. SDK calls and change callbacks run outside
+the state lock. The worker processes resilience events before publishing results
+and polls while idle so late events are processed without a new
+submission. Successful operations end access after completion and once no tracked
+hazard overlaps their memory. Failed operations conservatively retain memory until
+successful SDK teardown; a failed teardown keeps access protected and can be retried.
+Drain cancels queued work, leaves started work protected, and rejects new work.
+
+`kvcr_driver.py` implements `StoreDriver` and `RegistersRegionsTogether` as
+`KvcrDriver`. It registers one host staging region, once per driver lifetime,
+and allocates a separate KVCR DRAM cache in whole-object slots. The worker retains
+that allocation until native teardown succeeds. No SDK is imported until registration.
+The declared capabilities are get/put, one span per row, host memory only,
+optional peer hints, no cancel/probe, and a configurable row limit (64 by default).
+
+Use the existing `RegionBinding(regions, driver, hold)` and `BlobBackend` assembly
+with this driver. `register_regions` opens KVCR. `drain` ends only operations;
+it does not close the registered runtime. `unregister_regions` requires proven
+access end before requesting native teardown, and retains the registration on
+teardown failure. Release the lender's hold only after revocation, then close the
+drained driver. A startup failure returns a registration handle and retains its
+owned cache when native registration may have escaped.
+
+`kvcr_setup.open_kvcr_driver` accepts a driver option mapping or a YAML file with
+those same constructor keys. It opens an unregistered driver without importing
+KVCR; the SDK and listeners are opened during region registration. For example:
+
+```yaml
+cache_slots: 64
+endpoint: trtllm-worker-a
+listen_port: 19341
+control_port: 19342  # Optional, enables peer fetch.
+control_host: 127.0.0.1
+```
+
+Pass the returned driver to the existing `RegionBinding` and `BlobBackend`.
+No runtime factory, executor activation or request configuration is installed.
+
+Failed transfers currently become unprovable and retain the affected attempts and
+registration; driver drain does not force SDK teardown to claim those accesses ended.
+Earlier release after failed-operation quiescence, multiple host regions,
+full driver conformance qualification, and inference activation remain separate work.
+
+The opt-in native tests run directly, through the worker, and through `BlobBackend`
+with `KvcrDriver`. They overwrite sources after publication and fill destinations
+with each expected payload's bitwise inverse before fetching and comparing all bytes.
+
+### KVCR peer fetch and lender validation
+
+Set `control_port` on each `KvcrDriver` to enable peer fetch. This is a separate
+port from `listen_port` (NIXL). `control_host` is the bind and advertise address;
+its default, `127.0.0.1`, supports peers on the same machine. The provider uses
+the pinned KVCR SDK's `ZmqPeerControlChannel` transport. Pass
+an immutable `KvHintsSnapshot` from `tensorrt_llm.kv_hints.protocol` as the source
+argument to `BlobBackend.fetch`. Orchestration selects one supported `kv.fetch`
+version `1.0` action before the driver is called. Its payload supplies
+`source_control_endpoint` and a nonempty list of unsigned 64-bit `block_hashes`.
+The worker passes `hint.to_msgspec()` directly to KVCR's `submit_hint`, preserving
+the complete provider payload and its hash constraints. KVCR interprets and
+validates the payload. This integration requires the shared `KvHintsSnapshot.to_msgspec()`
+accessor and defines no separate peer-hint model or envelope converter.
+Both peers must use the same blob key
+namespace. Full object keys remain the lookup identities; their hashes only
+express hint membership through the provider's key adapter.
+
+Each submitted batch receives a distinct KVCR hint request ID, passed to query
+and delivery and discarded after completion. The shared immutable snapshot may
+be reused across batches without leaking per-operation SDK state.
+
+Publish to the source KVCR cache before fetching from a peer. The source serves
+KVCR-owned DRAM. Acquiring source data on demand from framework memory through
+pin callbacks is not implemented. No serving request handler is installed.
+
+For local native QA, run in the GPU development container with KVCR/NIXL/UCX:
+
+```bash
+TRTLLM_TEST_KVCR_NATIVE=1 python -m pytest \
+  tests/unittest/_torch/pyexecutor/kv_cache/sharing/test_kvcr_round_trip.py -q
+```
+
+These tests exercise real KV managers and lender GPU-to-host and host-to-GPU
+copies. They check a cold miss, local restoration after destroying producer data,
+and a peer fetch between two independently populated KVCR runtimes. The peer
+target first demonstrates a local miss; only the hinted fetch restores its GPU
+pages. This is a same-machine peer transport check, not a cross-machine deployment
+or serving inference test. The native tests are opt-in local QA; ordinary CPU
+hint tests are selected by the existing `l0_cpu.yml` disaggregation directory entry.
+The backend case transfers two distinct 4 KiB objects, checks surrounding canaries,
+and exercises registration revocation and manager-thread hold release. Three shared
+driver conformance checks also cover whole-row copies and committed duplicate writes
+against real KVCR. Run with a compatible KVCR installation (currently NIXL 1.5.0 and UCX):
+
+```bash
+TRTLLM_TEST_KVCR_NATIVE=1 python -m pytest -m cpu_only \
+  tests/unittest/_torch/disaggregation/blob/test_kvcr_worker_sdk.py \
+  tests/unittest/_torch/disaggregation/blob/test_kvcr_worker.py \
+  tests/unittest/_torch/disaggregation/blob/test_kvcr_driver.py
+```
+
+Without that variable, the native transport test is skipped; request translation,
+registration validation, owner-thread enforcement, and event resolution use a
+recording runtime and run with the CPU component tests when KVCR is installed.
+
 The boundary is `store.py`; its docstrings are the specification. The rules that shape a driver:
 
 1. **`DriverRejected` is the only raise that certifies nothing escaped.** It is raised before the
