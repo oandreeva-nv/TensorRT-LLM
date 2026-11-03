@@ -25,9 +25,11 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("with_extensions", [False, True])
-def test_snapshot_msgspec_preserves_wire_fields(with_extensions: bool) -> None:
+def test_snapshot_msgspec_decodes_protocol_fields(with_extensions: bool) -> None:
     wire = _wire()
     wire["actions"][0]["payload"]["block_hashes"] = [0, (1 << 64) - 1]
+    wire["actions"][0]["payload"]["provider_metadata"] = {"future": [1, None, True]}
+    expected = json.loads(json.dumps(wire))
     if with_extensions:
         for name in ("producer_metadata", "x-extension", "__class__", "_extra_0", ""):
             wire[name] = {"trace": ["router-a", None, True, 7.5]}
@@ -43,8 +45,9 @@ def test_snapshot_msgspec_preserves_wire_fields(with_extensions: bool) -> None:
     assert envelope.protocol_version == "0.1"
     assert envelope.actions[0].action_type == "kv.fetch"
     assert envelope.actions[0].payload["block_hashes"] == [0, (1 << 64) - 1]
-    assert msgspec.json.decode(msgspec.json.encode(envelope)) == wire
-    assert msgspec.msgpack.decode(msgspec.msgpack.encode(envelope)) == wire
+    assert msgspec.json.decode(msgspec.json.encode(envelope)) == expected
+    assert msgspec.msgpack.decode(msgspec.msgpack.encode(envelope)) == expected
+    assert snapshot.envelope().model_dump(mode="json") == wire
 
 
 def test_snapshot_msgspec_returns_independent_nested_values() -> None:

@@ -133,15 +133,14 @@ of rebuilding Pydantic models and calling `model_dump()`:
 consumer.submit_hint(snapshot.to_msgspec(), request_id)
 ```
 
-The returned envelope and each action are msgspec structs. Known envelope and
-action fields are available as attributes; payload dictionaries stay opaque.
-Unknown envelope and action fields retain their original names in JSON and
-MessagePack serialization, including names that are not Python identifiers.
-They are not added as consumer-facing attributes. Each call decodes fresh nested
-values, so consumer mutation cannot change the snapshot or another consumer's
-copy. Struct layouts are cached with a bounded cache; payload values are not
-cached. This accessor converts already admitted metadata and does not perform
-provider validation, authorize endpoints or execute actions.
+The returned envelope and each action are fixed msgspec structs containing the
+defined protocol fields. Extra envelope and action fields are ignored in this
+consumer view; the original snapshot and `snapshot.envelope()` still retain
+them. Payload dictionaries stay opaque and preserve all provider-specific
+fields. A single reusable decoder creates fresh nested values on each call, so
+consumer mutation cannot change the snapshot or another consumer's copy. This
+accessor converts already admitted metadata and does not perform provider
+validation, authorize endpoints or execute actions.
 
 HTTP request text representations omit `kv_hints`, including when a request is
 formatted in an error log. JSON serialization and proxy forwarding retain the

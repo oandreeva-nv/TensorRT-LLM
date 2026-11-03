@@ -9,7 +9,6 @@ an envelope does not activate a backend, perform a fetch, or apply source policy
 
 import json
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import TypeAlias
 
 import msgspec
@@ -65,6 +64,22 @@ class KvHintsEnvelope(BaseModel):
 KvHintsInput: TypeAlias = KvHintsEnvelope | dict[str, JsonValue]
 
 
+class _KvHintActionWire(msgspec.Struct, frozen=True):
+    action_id: str
+    action_type: str
+    action_version: str
+    payload: dict[str, object]
+
+
+class _KvHintsEnvelopeWire(msgspec.Struct, frozen=True):
+    protocol_version: str
+    message_id: str
+    actions: list[_KvHintActionWire]
+
+
+_MSGSPEC_HINTS_DECODER = msgspec.json.Decoder(_KvHintsEnvelopeWire)
+
+
 @dataclass(frozen=True, slots=True)
 class KvHintsSnapshot:
     """Immutable admitted metadata, including every nested payload value.
@@ -84,41 +99,16 @@ class KvHintsSnapshot:
         return KvHintsEnvelope.model_validate_json(self.wire_json)
 
     def to_msgspec(self) -> msgspec.Struct:
-        """Decode an independent msgspec envelope for a metadata consumer.
+        """Decode the protocol fields as an independent msgspec envelope.
 
-        The envelope and each action are structs with the shared model's known
-        fields available as attributes. Unknown fields retain their wire names
-        when serialized. Payloads remain opaque and are not revalidated.
+        Extra envelope and action fields are ignored in this view, but remain
+        in the snapshot. Payload dictionaries retain all provider-specific
+        fields without interpreting them.
 
         Each call decodes fresh nested values from the admitted JSON, without
         constructing Pydantic models or exposing mutable snapshot state.
         """
-        fields = msgspec.json.decode(self.wire_json)
-        fields["actions"] = [
-            _as_msgspec_struct(KvHintAction, action) for action in fields["actions"]
-        ]
-        return _as_msgspec_struct(KvHintsEnvelope, fields)
-
-
-def _as_msgspec_struct(model: type[BaseModel], fields: dict[str, object]) -> msgspec.Struct:
-    struct_type = _msgspec_struct_type(model, tuple(fields))
-    return struct_type(*fields.values())
-
-
-@lru_cache(maxsize=128)
-def _msgspec_struct_type(
-    model: type[BaseModel], wire_names: tuple[str, ...]
-) -> type[msgspec.Struct]:
-    """Cache bounded wire layouts, including optional JSON extension fields."""
-    fields = [
-        (
-            name if name in model.model_fields else f"_extra_{index}",
-            object,
-            msgspec.field(name=name),
-        )
-        for index, name in enumerate(wire_names)
-    ]
-    return msgspec.defstruct(f"{model.__name__}Wire", fields, frozen=True)
+        return _MSGSPEC_HINTS_DECODER.decode(self.wire_json)
 
 
 def admit_kv_hints(hints: KvHintsInput | None) -> KvHintsEnvelope | None:
